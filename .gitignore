@@ -114,6 +114,7 @@ claude.config.json
 .cursor/
 .aider*
 .continue/
+.omg/
 
 AGENTS.md
 CLAUDE.md
