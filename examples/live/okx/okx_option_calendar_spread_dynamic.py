@@ -25,11 +25,11 @@ candidates.
 The default runtime is data-only and does not submit orders. Live execution requires
 both ``--enable-execution`` and ``--no-dry-run``.
 
-中文说明：
-这个示例用于“动态发现”的 OKX 期权日历价差监控。它不预先写死两个具体合约，
-而是先让 OKX instrument provider 加载 BTC/ETH 期权全量定义，再从 Nautilus cache
-里按 underlying、结算币种、到期日、行权价、看涨/看跌类型分组，自动生成 near/far
-到期组合。默认只输出可执行的 dry-run 腿参数，不会真实下单。
+中文说明:
+这个示例用于“动态发现”的 OKX 期权日历价差监控。它不预先写死两个具体合约,
+而是先让 OKX instrument provider 加载 BTC/ETH 期权全量定义,再从 Nautilus cache
+里按 underlying、结算币种、到期日、行权价、看涨/看跌类型分组,自动生成 near/far
+到期组合。默认只输出可执行的 dry-run 腿参数,不会真实下单。
 """
 
 from __future__ import annotations
@@ -78,8 +78,8 @@ NS_PER_DAY = 86_400_000_000_000
 
 
 def _code(value: Any) -> str:
-    # Nautilus 的 Currency/Symbol 等对象通常有 code 字段；测试替身或 PyO3 对象可能只有
-    # __str__。统一转成字符串，避免动态发现逻辑绑定到某一个具体 instrument 类型。
+    # Nautilus 的 Currency/Symbol 等对象通常有 code 字段;测试替身或 PyO3 对象可能只有
+    # __str__。统一转成字符串,避免动态发现逻辑绑定到某一个具体 instrument 类型。
     if hasattr(value, "code"):
         return str(value.code)
     return str(value)
@@ -103,14 +103,14 @@ def _decimal(value: Any) -> Decimal:
 
 
 def _pyo3_price(value: Any) -> nautilus_pyo3.Price:
-    # OptionChainSlice 是 PyO3 暴露出来的对象，get_call_quote/get_put_quote 需要
-    # nautilus_pyo3.Price；Cython Price 不能直接传入。
+    # OptionChainSlice 是 PyO3 暴露出来的对象,get_call_quote/get_put_quote 需要
+    # nautilus_pyo3.Price;Cython Price 不能直接传入。
     return nautilus_pyo3.Price.from_str(str(value))
 
 
 def _instrument_settlement_currency(instrument: Instrument) -> str:
-    # OKX 期权的 instrument family 形如 BTC-USD/ETH-USD，但 OptionSeriesId 的第三个
-    # 字段是 settlement_currency。对 inverse crypto option，结算币种可能是 BTC/ETH，
+    # OKX 期权的 instrument family 形如 BTC-USD/ETH-USD,但 OptionSeriesId 的第三个
+    # 字段是 settlement_currency。对 inverse crypto option,结算币种可能是 BTC/ETH,
     # 不能简单用 quote_currency=USD 代替。
     if hasattr(instrument, "get_settlement_currency"):
         return _code(instrument.get_settlement_currency())
@@ -145,8 +145,8 @@ class OptionSeriesKey:
     """
     Nautilus option-chain 订阅的最小 series 维度。
 
-    OKX 动态发现先在 instrument 层看到每个具体合约，然后必须降维成
-    OptionSeriesId(venue, underlying, settlement_currency, expiration_ns)，DataEngine
+    OKX 动态发现先在 instrument 层看到每个具体合约,然后必须降维成
+    OptionSeriesId(venue, underlying, settlement_currency, expiration_ns),DataEngine
     才能为该到期序列维护一组 call/put quote、greeks 和 ATM 附近 strike。
     """
 
@@ -175,8 +175,8 @@ class CalendarInstrumentRecord:
     """
     从 Nautilus instrument 归一化出来的日历价差候选合约记录。
 
-    这里保存 quote_currency 和 settlement_currency 两个字段，是为了避免把 OKX 的
-    family 命名口径误用成真实结算口径。pair_key 会用二者共同分组，确保 BTC/ETH、
+    这里保存 quote_currency 和 settlement_currency 两个字段,是为了避免把 OKX 的
+    family 命名口径误用成真实结算口径。pair_key 会用二者共同分组,确保 BTC/ETH、
     USD 计价和币本位结算的合约不会被错误配成一组。
     """
 
@@ -235,8 +235,8 @@ class CalendarInstrumentRecord:
 
 @dataclass(frozen=True)
 class CalendarPair:
-    # 一个日历价差 pair 总是同 underlying、同结算币种、同 call/put、同行权价，
-    # 仅到期日不同：near leg 用近月，far leg 用远月。
+    # 一个日历价差 pair 总是同 underlying、同结算币种、同 call/put、同行权价,
+    # 仅到期日不同:near leg 用近月,far leg 用远月。
     near: CalendarInstrumentRecord
     far: CalendarInstrumentRecord
 
@@ -251,8 +251,8 @@ class CalendarPair:
 
 @dataclass(frozen=True)
 class OrderLegPlan:
-    # 这里是“可执行参数”的 dry-run 表达：具体合约、方向、数量、限价和 TIF。
-    # 是否真正 submit，由 DynamicCalendarSpreadConfig 的执行开关控制。
+    # 这里是“可执行参数”的 dry-run 表达:具体合约、方向、数量、限价和 TIF。
+    # 是否真正 submit,由 DynamicCalendarSpreadConfig 的执行开关控制。
     instrument_id: InstrumentId
     side: OrderSide
     quantity: Decimal
@@ -262,8 +262,8 @@ class OrderLegPlan:
 
 @dataclass(frozen=True)
 class CalendarOpportunity:
-    # 当前实现只识别开多日历价差：卖 near bid、买 far ask。它是行情候选，不代表已经
-    # 下单或持仓成功；真实执行时还需要两腿成交后的残腿风险处理。
+    # 当前实现只识别开多日历价差:卖 near bid、买 far ask。它是行情候选,不代表已经
+    # 下单或持仓成功;真实执行时还需要两腿成交后的残腿风险处理。
     pair: CalendarPair
     near_quote: Any
     far_quote: Any
@@ -276,7 +276,7 @@ def normalize_option_instrument(
     instrument: Instrument,
     underlyings: tuple[str, ...],
 ) -> CalendarInstrumentRecord | None:
-    # 动态发现的入口：从 cache/instrument events 里拿到任意 Instrument，只有具备
+    # 动态发现的入口:从 cache/instrument events 里拿到任意 Instrument,只有具备
     # option_kind、strike_price、expiration_ns、underlying 的期权合约才会进入候选池。
     if not _is_option_instrument(instrument):
         return None
@@ -303,8 +303,8 @@ def build_calendar_pairs(
     records: list[CalendarInstrumentRecord],
     expiry_pair_mode: str,
 ) -> list[CalendarPair]:
-    # 先按业务上必须完全一致的维度分桶，再在每个桶内按到期日排序生成 near/far。
-    # all 模式会生成同一 strike 的全部近远月组合；adjacent 只生成相邻到期组合。
+    # 先按业务上必须完全一致的维度分桶,再在每个桶内按到期日排序生成 near/far。
+    # all 模式会生成同一 strike 的全部近远月组合;adjacent 只生成相邻到期组合。
     by_key: dict[tuple[str, str, str, str, str], list[CalendarInstrumentRecord]] = {}
     for record in records:
         by_key.setdefault(record.pair_key, []).append(record)
@@ -333,8 +333,8 @@ def build_strike_range(
     atm_percent: float,
     fixed_strikes: tuple[Price, ...] = (),
 ) -> nautilus_pyo3.StrikeRange | None:
-    # 默认使用 ATM 附近 strike，避免一启动就订阅全市场所有行权价。只有显式传
-    # all_strikes 时才返回 None，让 DataEngine 使用该 series 的全部 strike。
+    # 默认使用 ATM 附近 strike,避免一启动就订阅全市场所有行权价。只有显式传
+    # all_strikes 时才返回 None,让 DataEngine 使用该 series 的全部 strike。
     if policy == "atm_relative":
         return nautilus_pyo3.StrikeRange.atm_relative(strikes_above, strikes_below)
     if policy == "atm_percent":
@@ -356,8 +356,8 @@ def evaluate_calendar_opportunity(
     order_qty: Decimal,
     time_in_force: TimeInForce,
 ) -> CalendarOpportunity | None:
-    # 两个到期序列的 snapshot 必须足够同步；否则 near bid 和 far ask 可能来自
-    # 不同市场时刻，计算出的价差不具备可交易意义。
+    # 两个到期序列的 snapshot 必须足够同步;否则 near bid 和 far ask 可能来自
+    # 不同市场时刻,计算出的价差不具备可交易意义。
     near_ts = int(getattr(near_chain, "ts_event", 0) or 0)
     far_ts = int(getattr(far_chain, "ts_event", 0) or 0)
     if abs(near_ts - far_ts) > max_cross_series_skew_ms * 1_000_000:
@@ -367,7 +367,7 @@ def evaluate_calendar_opportunity(
     if now_ns - near_ts > max_age_ns or now_ns - far_ts > max_age_ns:
         return None
 
-    # OptionChainSlice 的 quote lookup 走 PyO3 Price，不能直接使用 Cython Price。
+    # OptionChainSlice 的 quote lookup 走 PyO3 Price,不能直接使用 Cython Price。
     chain_strike = _pyo3_price(pair.strike_price)
     if pair.option_kind == "CALL":
         near_quote = near_chain.get_call_quote(chain_strike)
@@ -384,8 +384,8 @@ def evaluate_calendar_opportunity(
     if near_bid <= 0 or far_ask <= 0:
         return None
 
-    # 开多日历价差的可执行腿：卖近月 bid，买远月 ask。用 IOC 是为了在真实执行路径
-    # 下尽量避免挂单滞留；dry-run 路径只记录这些具体参数。
+    # 开多日历价差的可执行腿:卖近月 bid,买远月 ask。用 IOC 是为了在真实执行路径
+    # 下尽量避免挂单滞留;dry-run 路径只记录这些具体参数。
     return CalendarOpportunity(
         pair=pair,
         near_quote=near_quote,
@@ -412,8 +412,8 @@ def evaluate_calendar_opportunity(
 
 
 class DynamicCalendarSpreadConfig(StrategyConfig, frozen=True, kw_only=True):
-    # 该配置刻意把行情发现和真实执行分开：dry_run 默认为 True，execution_enabled
-    # 默认为 False。只有两个开关同时解除保护时，策略才会创建执行客户端并提交订单。
+    # 该配置刻意把行情发现和真实执行分开:dry_run 默认为 True,execution_enabled
+    # 默认为 False。只有两个开关同时解除保护时,策略才会创建执行客户端并提交订单。
     venue: Venue = Venue(OKX)
     underlyings: tuple[str, ...] = ("BTC", "ETH")
     instrument_family_codes: tuple[str, ...] = ("BTC-USD", "ETH-USD")
@@ -441,26 +441,26 @@ class DynamicCalendarSpreadConfig(StrategyConfig, frozen=True, kw_only=True):
 class DynamicCalendarSpreadStrategy(Strategy):
     def __init__(self, config: DynamicCalendarSpreadConfig) -> None:
         super().__init__(config)
-        # _records_by_id 是当前发现到的可交易期权池；它会由 cache 初始化和 instrument
+        # _records_by_id 是当前发现到的可交易期权池;它会由 cache 初始化和 instrument
         # 事件增量更新共同维护。
         self._records_by_id: dict[InstrumentId, CalendarInstrumentRecord] = {}
-        # _subscribed_series 记录已经订阅过的 OptionSeriesId 字符串，避免 refresh 时重复订阅。
+        # _subscribed_series 记录已经订阅过的 OptionSeriesId 字符串,避免 refresh 时重复订阅。
         self._subscribed_series: set[str] = set()
-        # _latest_chains 保存每个到期序列最新的 OptionChainSlice，机会扫描只在近远月
+        # _latest_chains 保存每个到期序列最新的 OptionChainSlice,机会扫描只在近远月
         # 两个 chain 都可用时进行。
         self._latest_chains: dict[str, Any] = {}
         self._pairs: list[CalendarPair] = []
-        # 真实执行路径的最小状态机：DISCOVERING -> OPENING -> OPEN 或 FAILED_NEEDS_FLATTEN。
+        # 真实执行路径的最小状态机:DISCOVERING -> OPENING -> OPEN 或 FAILED_NEEDS_FLATTEN。
         self._position_state = "DISCOVERING"
         self._pending_opportunity: CalendarOpportunity | None = None
         self._filled_qty_by_instrument: dict[InstrumentId, Decimal] = {}
 
     def on_start(self) -> None:
         self._validate_config()
-        # 启动时先扫描 cache，因为 OKX provider 通常已在 data client connect 阶段加载
+        # 启动时先扫描 cache,因为 OKX provider 通常已在 data client connect 阶段加载
         # load_all=True 的 instrument definitions。
         self._refresh_from_cache()
-        # 后续 instrument updates 继续进入 on_instrument，用于捕捉新增/状态变化合约。
+        # 后续 instrument updates 继续进入 on_instrument,用于捕捉新增/状态变化合约。
         self.subscribe_instruments(self.config.venue, client_id=ClientId(OKX))
         self.request_instruments(
             self.config.venue,
@@ -485,7 +485,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
         with suppress(KeyError):
             self.clock.cancel_timer("dynamic_calendar_refresh")
 
-        # 主动退订已订阅的 option chains，保证 live node shutdown 不留下内部订阅状态。
+        # 主动退订已订阅的 option chains,保证 live node shutdown 不留下内部订阅状态。
         for series_key in list(self._subscribed_series):
             key = self._series_key_from_string(series_key)
             self.unsubscribe_option_chain(key.to_series_id(), client_id=ClientId(OKX))
@@ -496,14 +496,14 @@ class DynamicCalendarSpreadStrategy(Strategy):
             self._sync_option_chain_subscriptions()
 
     def on_option_chain(self, chain_slice: Any) -> None:
-        # DataEngine 每次推送某个 series 的聚合切片后，策略用最新 near/far chain 扫描机会。
+        # DataEngine 每次推送某个 series 的聚合切片后,策略用最新 near/far chain 扫描机会。
         series_key = str(chain_slice.series_id)
         self._latest_chains[series_key] = chain_slice
         self._scan_opportunities()
 
     def on_order_filled(self, event: Any) -> None:
-        # 只有真实执行路径会依赖成交事件。两腿都达到目标数量后才认为价差仓位 OPEN；
-        # 单腿成交不算成功，因为残腿风险仍然存在。
+        # 只有真实执行路径会依赖成交事件。两腿都达到目标数量后才认为价差仓位 OPEN;
+        # 单腿成交不算成功,因为残腿风险仍然存在。
         instrument_id = event.instrument_id
         last_qty = _decimal(event.last_qty)
         self._filled_qty_by_instrument[instrument_id] = (
@@ -535,7 +535,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
         self._handle_residual_risk(event)
 
     def _validate_config(self) -> None:
-        # OKX options 不能只靠 instrument_types=OPTION；必须给 instrument_families，否则
+        # OKX options 不能只靠 instrument_types=OPTION;必须给 instrument_families,否则
         # provider 无法知道要加载 BTC-USD、ETH-USD 还是其他 family。
         if str(self.config.venue) == OKX and not self.config.instrument_family_codes:
             raise ValueError(
@@ -554,7 +554,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
         self._refresh_from_cache()
 
     def _refresh_from_cache(self) -> None:
-        # refresh 是幂等的：反复扫描 cache、重建 pairs、同步订阅；已有订阅不会重复发出。
+        # refresh 是幂等的:反复扫描 cache、重建 pairs、同步订阅;已有订阅不会重复发出。
         for instrument in self.cache.instruments():
             self._upsert_instrument(instrument)
         self._rebuild_pairs()
@@ -591,7 +591,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
         )
 
     def _candidate_series_keys(self) -> list[OptionSeriesKey]:
-        # 按 underlying/settlement/expiry 稳定排序，方便 live dry-run 限制订阅数量时可复现。
+        # 按 underlying/settlement/expiry 稳定排序,方便 live dry-run 限制订阅数量时可复现。
         keys = sorted(
             {record.series_key for record in self._records_by_id.values()},
             key=lambda k: (k.underlying_code, k.settlement_currency, k.expiration_ns),
@@ -605,7 +605,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
 
     def _sync_option_chain_subscriptions(self) -> None:
         # 订阅的是“到期序列”而不是单个合约。DataEngine 会按 StrikeRange 管理该序列内
-        # 对应 strike 的 quote/greeks，并推送 OptionChainSlice 给 on_option_chain。
+        # 对应 strike 的 quote/greeks,并推送 OptionChainSlice 给 on_option_chain。
         strike_range = build_strike_range(
             policy=self.config.strike_range_policy,
             strikes_above=self.config.atm_strikes_above,
@@ -629,7 +629,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
         now_ns = self.clock.timestamp_ns()
         emitted = 0
         for pair in self._pairs:
-            # 近月和远月 chain 都存在时才可评估；动态发现阶段可能先订阅到其中一个。
+            # 近月和远月 chain 都存在时才可评估;动态发现阶段可能先订阅到其中一个。
             near_chain = self._latest_chains.get(str(pair.near.series_key.to_series_id()))
             far_chain = self._latest_chains.get(str(pair.far.series_key.to_series_id()))
             if near_chain is None or far_chain is None:
@@ -651,7 +651,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
             self._log_opportunity(opportunity)
             emitted += 1
             if self.config.execution_enabled and not self.config.dry_run:
-                # 真实下单路径每次只提交一个机会，避免同一扫描周期打开多组价差仓位。
+                # 真实下单路径每次只提交一个机会,避免同一扫描周期打开多组价差仓位。
                 self._submit_open_orders(opportunity)
                 break
             if emitted >= self.config.max_opportunities_per_scan:
@@ -675,7 +675,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
 
     def _submit_open_orders(self, opportunity: CalendarOpportunity) -> None:
         # 防止重复开仓或在残腿状态下继续提交新订单。FAILED_NEEDS_FLATTEN 需要人工或后续
-        # 独立 flatten 逻辑处理，不能靠继续开新 spread 掩盖风险。
+        # 独立 flatten 逻辑处理,不能靠继续开新 spread 掩盖风险。
         if self._position_state in {"OPENING", "OPEN", "FAILED_NEEDS_FLATTEN"}:
             return
 
@@ -700,7 +700,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
         self._position_state = "OPENING"
 
     def _handle_residual_risk(self, event: Any) -> None:
-        # 任一腿 reject/cancel/expire 都意味着组合开仓不完整，进入显式失败状态，避免
+        # 任一腿 reject/cancel/expire 都意味着组合开仓不完整,进入显式失败状态,避免
         # 策略继续把它当作正常未持仓状态。
         if self._pending_opportunity is None:
             return
@@ -737,7 +737,7 @@ def build_node(args: argparse.Namespace) -> TradingNode:
     families = _parse_csv_tuple(args.instrument_families)
     should_add_exec = args.enable_execution and not args.dry_run
 
-    # 数据客户端始终启用：动态发现、option-chain 订阅、dry-run 候选都只依赖行情路径。
+    # 数据客户端始终启用:动态发现、option-chain 订阅、dry-run 候选都只依赖行情路径。
     data_client = OKXDataClientConfig(
         environment=environment,
         instrument_provider=InstrumentProviderConfig(load_all=True),
@@ -751,7 +751,7 @@ def build_node(args: argparse.Namespace) -> TradingNode:
     risk_engine = LiveRiskEngineConfig()
     if should_add_exec:
         # 只有同时传 --enable-execution 和 --no-dry-run 才创建执行客户端。这样即使用户
-        # 提供了真实账户凭证，默认运行也仍然是 data-only。
+        # 提供了真实账户凭证,默认运行也仍然是 data-only。
         exec_clients[OKX] = OKXExecClientConfig(
             environment=environment,
             instrument_provider=InstrumentProviderConfig(load_all=True),
@@ -820,8 +820,8 @@ def build_node(args: argparse.Namespace) -> TradingNode:
 def schedule_node_stop(delay_seconds: int) -> None:
     if delay_seconds <= 0:
         return
-    # live smoke 需要可自动退出的 node。这里发送 SIGINT 走 TradingNode 的正常 shutdown，
-    # 而不是强杀进程，便于验证 unsubscribe/dispose 路径。
+    # live smoke 需要可自动退出的 node。这里发送 SIGINT 走 TradingNode 的正常 shutdown,
+    # 而不是强杀进程,便于验证 unsubscribe/dispose 路径。
     subprocess.Popen(  # noqa: S603
         ["/bin/sh", "-c", f"sleep {delay_seconds}; kill -{signal.SIGINT} {os.getpid()}"],
         stdout=subprocess.DEVNULL,
