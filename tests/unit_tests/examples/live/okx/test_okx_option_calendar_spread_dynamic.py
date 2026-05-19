@@ -49,6 +49,8 @@ def _okx_option(
     strike: str = "70000",
     kind: OptionKind = OptionKind.CALL,
 ) -> CryptoOption:
+    # 构造最小 OKX CryptoOption fixture。测试只关心动态发现和配对逻辑，
+    # 不需要启动 OKX provider 或 websocket。
     return CryptoOption(
         instrument_id=InstrumentId.from_str(f"{symbol}.OKX"),
         raw_symbol=Symbol(symbol),
@@ -70,6 +72,8 @@ def _okx_option(
 
 
 def _quote(instrument_id: InstrumentId, bid: str, ask: str, ts_event: int) -> QuoteTick:
+    # OptionChainSlice 返回的 quote 在真实运行中来自 DataEngine；单测用 QuoteTick
+    # 直接表达 bid/ask，便于验证最终 order leg 的价格来源。
     return QuoteTick(
         instrument_id=instrument_id,
         bid_price=Price.from_str(bid),
@@ -82,6 +86,8 @@ def _quote(instrument_id: InstrumentId, bid: str, ask: str, ts_event: int) -> Qu
 
 
 class FakeChain:
+    # 轻量替身，只实现 evaluate_calendar_opportunity 需要的 chain API。
+    # 这里刻意断言 strike 来自 nautilus_pyo3.Price，防止回归为 Cython Price。
     def __init__(self, ts_event: int, calls: dict[Price, QuoteTick] | None = None):
         self.ts_event = ts_event
         self._calls = {str(strike): quote for strike, quote in (calls or {}).items()}
@@ -95,6 +101,8 @@ class FakeChain:
 
 
 def test_normalize_crypto_option_uses_currency_underlying_code_and_settlement_currency():
+    # 保护 OKX series 生成的关键口径：underlying 用 BTC/ETH 代码，settlement_currency
+    # 必须来自 instrument 本身。inverse option 不能被误归到 USD settlement series。
     instrument = _okx_option(
         symbol="BTC-USD-260626-70000-C",
         underlying=BTC,
@@ -148,6 +156,8 @@ def test_normalize_crypto_option_uses_currency_underlying_code_and_settlement_cu
 
 
 def test_build_calendar_pairs_all_mode_generates_all_near_far_expiry_pairs():
+    # all 模式应该为同一 underlying/strike/kind 的 N 个到期日生成 N*(N-1)/2 个
+    # near/far 组合，而不是只取最近两个到期日。
     records = [
         normalize_option_instrument(
             _okx_option(f"BTC-USD-{date}-70000-C", BTC, expiry),
@@ -169,6 +179,8 @@ def test_build_calendar_pairs_all_mode_generates_all_near_far_expiry_pairs():
 
 
 def test_build_calendar_pairs_keeps_btc_and_eth_universes_separate():
+    # BTC 和 ETH 即使到期日、行权价形态相似，也必须分属不同日历价差 universe，
+    # 否则会生成跨 underlying 的不可执行组合。
     records = [
         normalize_option_instrument(
             _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
@@ -195,6 +207,7 @@ def test_build_calendar_pairs_keeps_btc_and_eth_universes_separate():
 
 
 def test_default_strike_range_policy_does_not_request_all_strikes():
+    # 默认策略只订阅 ATM 附近 strike，避免 live 启动时一次性订阅全部行权价。
     strike_range = build_strike_range(
         policy="atm_relative",
         strikes_above=3,
@@ -206,6 +219,7 @@ def test_default_strike_range_policy_does_not_request_all_strikes():
 
 
 def test_all_strikes_policy_is_explicit():
+    # None 在 DataEngine 里表示 all strikes；这个高成本模式必须由用户显式选择。
     strike_range = build_strike_range(
         policy="all_strikes",
         strikes_above=3,
@@ -217,6 +231,8 @@ def test_all_strikes_policy_is_explicit():
 
 
 def test_opportunity_emits_executable_dry_run_leg_parameters_from_bid_ask():
+    # 开多日历价差的 dry-run 腿参数应来自真实可成交边：near 用 bid 卖出，
+    # far 用 ask 买入。测试直接锁定方向、数量、限价和 TIF。
     near = normalize_option_instrument(
         _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
         ("BTC",),
@@ -275,6 +291,8 @@ def test_opportunity_emits_executable_dry_run_leg_parameters_from_bid_ask():
 
 
 def test_opportunity_fails_closed_when_cross_series_snapshot_skew_is_too_large():
+    # near/far 两个 series 的快照如果相差太久，即使各自 bid/ask 都存在，也不能
+    # 生成候选。这个 fail-closed 规则避免用不同市场时刻拼出虚假的价差。
     near = normalize_option_instrument(
         _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
         ("BTC",),
