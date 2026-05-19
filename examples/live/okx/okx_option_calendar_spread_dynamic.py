@@ -412,30 +412,45 @@ def evaluate_calendar_opportunity(
 
 
 class DynamicCalendarSpreadConfig(StrategyConfig, frozen=True, kw_only=True):
-    # 该配置刻意把行情发现和真实执行分开:dry_run 默认为 True,execution_enabled
-    # 默认为 False。只有两个开关同时解除保护时,策略才会创建执行客户端并提交订单。
-    venue: Venue = Venue(OKX)
-    underlyings: tuple[str, ...] = ("BTC", "ETH")
-    instrument_family_codes: tuple[str, ...] = ("BTC-USD", "ETH-USD")
-    expiry_pair_mode: str = "all"
-    min_dte_days: int = 1
-    max_dte_days: int = 720
-    expiry_blackout_minutes: int = 60
-    series_subscription_policy: str = "all_discovered_series"
-    max_series_subscriptions: int = 0
-    strike_range_policy: str = "atm_relative"
-    atm_strikes_above: int = 3
-    atm_strikes_below: int = 3
-    atm_percent: float = 0.10
-    snapshot_interval_ms: int = 2_000
-    refresh_interval_secs: int = 60
-    stale_quote_ms: int = 5_000
-    max_cross_series_skew_ms: int = 1_000
-    max_opportunities_per_scan: int = 10
-    order_qty: Decimal = Decimal(1)
-    time_in_force: TimeInForce = TimeInForce.IOC
-    dry_run: bool = True
-    execution_enabled: bool = False
+    """
+    动态日历价差策略全量配置。dry_run/execution_enabled 双开关同时解除时才提交真实订单。
+    """
+
+    # ── 交易所 & 标的 ──────────────────────────────────────────────────────────
+    venue: Venue = Venue(OKX)                              # 目标交易所，须与 DataClient/ExecClient 一致
+    underlyings: tuple[str, ...] = ("BTC", "ETH")          # 关注的标的代码，只有列表内的期权才进候选池
+    instrument_family_codes: tuple[str, ...] = ("BTC-USD", "ETH-USD")  # OKX family 过滤，须与 DataClientConfig.instrument_families 一致；BTC-USD=币本位，BTC-USDC=U本位
+
+    # ── 到期日筛选 ─────────────────────────────────────────────────────────────
+    expiry_pair_mode: str = "all"           # 近/远月配对模式："all"=全量两两组合，"adjacent"=仅相邻到期日配对
+    min_dte_days: int = 1                   # 候选合约最小剩余到期天数，低于此值的合约不纳入候选池
+    max_dte_days: int = 720                 # 候选合约最大剩余到期天数，超出此值的远期合约通常流动性差
+    expiry_blackout_minutes: int = 60       # 到期前黑窗期（分钟），窗口内合约视为不可交易并从候选池移除
+
+    # ── 期权链订阅策略 ─────────────────────────────────────────────────────────
+    series_subscription_policy: str = "all_discovered_series"  # "all_discovered_series"=订阅全部筛选后序列；"ranked_active_series"=只订阅前 N 个
+    max_series_subscriptions: int = 0       # ranked_active_series 模式下的最大订阅序列数，0=不限制
+
+    # ── 行权价范围策略 ─────────────────────────────────────────────────────────
+    strike_range_policy: str = "atm_relative"  # StrikeRange 策略："atm_relative"|"atm_percent"|"fixed"|"all_strikes"
+    atm_strikes_above: int = 3             # atm_relative 模式：ATM 之上保留的行权价档数
+    atm_strikes_below: int = 3             # atm_relative 模式：ATM 之下保留的行权价档数
+    atm_percent: float = 0.10              # atm_percent 模式：覆盖 ATM ±N% 内的行权价，如 0.10=±10%
+
+    # ── 行情刷新与质量控制 ────────────────────────────────────────────────────
+    snapshot_interval_ms: int = 2_000      # DataEngine 推送 OptionChainSlice 的最低间隔（毫秒），0=每 tick 推
+    refresh_interval_secs: int = 60        # 定时重扫 cache、重建 pairs、补充订阅的间隔（秒）
+    stale_quote_ms: int = 5_000            # 行情过期阈值（毫秒），ts_event 超龄则跳过该 pair 的机会评估
+    max_cross_series_skew_ms: int = 1_000  # 近/远月 chain 时间戳最大偏差（毫秒），超出则两者不属于同一市场时刻
+
+    # ── 机会扫描 & 执行 ────────────────────────────────────────────────────────
+    max_opportunities_per_scan: int = 10   # 每次扫描最多输出/提交的候选机会数；真实执行路径固定为 1
+    order_qty: Decimal = Decimal(1)        # 每条腿委托数量（张），两腿相同，OKX 期权最小 1 张
+    time_in_force: TimeInForce = TimeInForce.IOC  # 委托 TIF，默认 IOC：未成交部分立即取消，避免挂单残留
+
+    # ── 执行安全开关（双重保险）────────────────────────────────────────────────
+    dry_run: bool = True            # 干跑开关，True=只记录日志不下单；需 --no-dry-run 才能进入执行路径
+    execution_enabled: bool = False  # 执行总开关，须与 dry_run=False 同时满足才会提交真实订单
 
 
 class DynamicCalendarSpreadStrategy(Strategy):
@@ -737,51 +752,53 @@ def build_node(args: argparse.Namespace) -> TradingNode:
     families = _parse_csv_tuple(args.instrument_families)
     should_add_exec = args.enable_execution and not args.dry_run
 
-    # 数据客户端始终启用:动态发现、option-chain 订阅、dry-run 候选都只依赖行情路径。
+    # 数据客户端始终启用；凭证(api_key/secret/passphrase)从环境变量读取，不写入代码。
     data_client = OKXDataClientConfig(
-        environment=environment,
-        instrument_provider=InstrumentProviderConfig(load_all=True),
-        instrument_types=(OKXInstrumentType.OPTION,),
-        instrument_families=families,
-        http_timeout_secs=10,
+        environment=environment,                                    # LIVE=实盘 WS，DEMO=模拟盘 WS
+        instrument_provider=InstrumentProviderConfig(load_all=True),  # 连接时全量加载合约定义，动态发现依赖此项
+        instrument_types=(OKXInstrumentType.OPTION,),              # 只加载期权合约，减少 REST 请求和 cache 占用
+        instrument_families=families,                               # 须与策略 instrument_family_codes 完全一致
+        http_timeout_secs=10,                                       # REST 单次请求超时（秒），留余量防网络抖动
     )
 
-    exec_clients = {}
-    exec_engine = LiveExecEngineConfig(reconciliation=False)
-    risk_engine = LiveRiskEngineConfig()
+    # dry-run 路径：不创建 ExecClient，关闭对账，使用默认风控配置
+    exec_clients: dict = {}
+    exec_engine = LiveExecEngineConfig(reconciliation=False)        # dry-run 不做开盘对账，避免无凭证报错
+    risk_engine = LiveRiskEngineConfig()                            # bypass 默认 False，但 dry-run 不下单故无影响
+
     if should_add_exec:
-        # 只有同时传 --enable-execution 和 --no-dry-run 才创建执行客户端。这样即使用户
-        # 提供了真实账户凭证,默认运行也仍然是 data-only。
+        # 仅当 --enable-execution + --no-dry-run 同时传入时才创建执行客户端，默认 data-only
         exec_clients[OKX] = OKXExecClientConfig(
-            environment=environment,
-            instrument_provider=InstrumentProviderConfig(load_all=True),
+            environment=environment,                                # 须与 DataClientConfig 一致，避免行情/执行连不同环境
+            instrument_provider=InstrumentProviderConfig(load_all=True),  # 确保下单时 instrument 定义已在 cache
             instrument_types=(OKXInstrumentType.OPTION,),
             instrument_families=families,
-            margin_mode=OKXMarginMode.CROSS,
-            use_fills_channel=False,
+            margin_mode=OKXMarginMode.CROSS,                       # 全仓模式，跨合约保证金可抵扣；ISOLATED=逐仓隔离
+            use_fills_channel=False,                               # False=依赖 orders 频道成交更新，减少 WS 订阅数
             http_timeout_secs=10,
         )
         exec_engine = LiveExecEngineConfig(
-            reconciliation=True,
-            open_check_interval_secs=5.0,
-            open_check_open_only=False,
-            position_check_interval_secs=60,
-            graceful_shutdown_on_exception=True,
+            reconciliation=True,                                   # 启动时向 OKX 查询持仓/挂单并与内部状态对账
+            open_check_interval_secs=5.0,                          # 定期轮询开放委托状态的间隔（秒），确保 IOC 取消及时同步
+            open_check_open_only=False,                            # False=同时检查 PARTIALLY_FILLED 等中间状态
+            position_check_interval_secs=60,                       # 持仓对账间隔（秒），检测残腿或强平导致的仓位偏差
+            graceful_shutdown_on_exception=True,                   # 未捕获异常时触发优雅关闭而非强制中断
         )
-        risk_engine = LiveRiskEngineConfig(bypass=False)
+        risk_engine = LiveRiskEngineConfig(bypass=False)            # 真实执行路径必须开启风控，委托经规则检查后才发往交易所
 
+    # ── TradingNodeConfig ─────────────────────────────────────────────────────
     config_node = TradingNodeConfig(
-        trader_id=TraderId(args.trader_id),
-        logging=LoggingConfig(log_level=args.log_level, use_pyo3=True),
-        data_clients={OKX: data_client},
-        exec_clients=exec_clients,
+        trader_id=TraderId(args.trader_id),                        # 交易员标识符，格式建议 NAME-NNN，各节点独立维护状态
+        logging=LoggingConfig(log_level=args.log_level, use_pyo3=True),  # use_pyo3=True 使用 Rust 高性能日志实现
+        data_clients={OKX: data_client},                           # venue→DataClientConfig 映射，build() 时实例化
+        exec_clients=exec_clients,                                  # dry-run 路径为空字典，不创建 ExecClient
         exec_engine=exec_engine,
         risk_engine=risk_engine,
-        timeout_connection=30.0,
-        timeout_reconciliation=10.0,
-        timeout_portfolio=10.0,
-        timeout_disconnection=10.0,
-        timeout_post_stop=2.0,
+        timeout_connection=30.0,                                    # 等待所有 Client WS 握手 + load_all 完成的超时（秒）
+        timeout_reconciliation=10.0,                               # 对账阶段查询持仓/挂单的超时（秒）
+        timeout_portfolio=10.0,                                     # Portfolio 初始化（获取余额/持仓快照）超时（秒）
+        timeout_disconnection=10.0,                                 # SIGTERM 后等待 WS 优雅断开的超时（秒）
+        timeout_post_stop=2.0,                                      # stop() 后到 dispose() 前留给内部队列 flush 的时间（秒）
     )
 
     node = TradingNode(config=config_node)
