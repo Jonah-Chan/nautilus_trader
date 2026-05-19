@@ -115,11 +115,13 @@ claude.config.json
 .aider*
 .continue/
 .omg/
+.omx/
+.omc/
 
-AGENTS.md
-CLAUDE.md
-CODEX.md
-GEMINI.md
+# AGENTS.md
+# CLAUDE.md
+# CODEX.md
+# GEMINI.md
 
 # Nautilus specific
 .ipynb_checkpoints/

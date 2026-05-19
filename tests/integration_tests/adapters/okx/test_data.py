@@ -35,6 +35,7 @@ from nautilus_trader.data.messages import SubscribeInstruments
 from nautilus_trader.data.messages import SubscribeOptionGreeks
 from nautilus_trader.data.messages import UnsubscribeInstrument
 from nautilus_trader.data.messages import UnsubscribeInstruments
+from nautilus_trader.data.messages import UnsubscribeInstrumentStatus
 from nautilus_trader.data.messages import UnsubscribeOptionGreeks
 from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.enums import BookType
@@ -225,6 +226,85 @@ async def test_subscribe_order_book_deltas_depth_50_with_vip_calls_compact(
 
 
 @pytest.mark.asyncio
+async def test_subscribe_order_book_depth_uses_books5(data_client_builder, monkeypatch):
+    # Arrange
+    client, public_ws, business_ws, http_client, instrument_provider = data_client_builder(
+        monkeypatch,
+    )
+
+    await client._connect()
+    try:
+        public_ws.subscribe_book_depth5.reset_mock()
+
+        command = SimpleNamespace(
+            book_type=BookType.L2_MBP,
+            depth=5,
+            instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
+        )
+
+        # Act
+        await client._subscribe_order_book_depth(command)
+
+        # Assert
+        public_ws.subscribe_book_depth5.assert_awaited_once()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_order_book_depth_rejects_invalid_depth(
+    data_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, public_ws, business_ws, http_client, instrument_provider = data_client_builder(
+        monkeypatch,
+    )
+
+    await client._connect()
+    try:
+        public_ws.subscribe_book_depth5.reset_mock()
+
+        command = SimpleNamespace(
+            book_type=BookType.L2_MBP,
+            depth=50,
+            instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
+        )
+
+        # Act
+        await client._subscribe_order_book_depth(command)
+
+        # Assert
+        public_ws.subscribe_book_depth5.assert_not_awaited()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_order_book_depth_uses_books5(data_client_builder, monkeypatch):
+    # Arrange
+    client, public_ws, business_ws, http_client, instrument_provider = data_client_builder(
+        monkeypatch,
+    )
+
+    await client._connect()
+    try:
+        public_ws.unsubscribe_book_depth5.reset_mock()
+
+        command = SimpleNamespace(
+            instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
+        )
+
+        # Act
+        await client._unsubscribe_order_book_depth(command)
+
+        # Assert
+        public_ws.unsubscribe_book_depth5.assert_awaited_once()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
 async def test_subscribe_bars_uses_business_websocket(data_client_builder, monkeypatch):
     # Arrange
     client, public_ws, business_ws, http_client, instrument_provider = data_client_builder(
@@ -355,6 +435,36 @@ async def test_unsubscribe_instrument_is_noop(
         # Act & Assert - should complete without error (no-op)
         # OKX instruments channel is subscribed at type level, cannot unsubscribe individual instruments
         await client._unsubscribe_instrument(command)
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_instrument_status_is_noop(
+    data_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, public_ws, business_ws, http_client, instrument_provider = data_client_builder(
+        monkeypatch,
+    )
+
+    await client._connect()
+    try:
+        initial_calls = list(public_ws.method_calls)
+        command = UnsubscribeInstrumentStatus(
+            instrument_id=InstrumentId(Symbol("BTC-USD-260521-77000-C"), OKX_VENUE),
+            client_id=None,
+            venue=OKX_VENUE,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act
+        await client._unsubscribe_instrument_status(command)
+
+        # Assert - status changes are detected via instrument updates, not a per-instrument channel.
+        assert public_ws.method_calls == initial_calls
     finally:
         await client._disconnect()
 

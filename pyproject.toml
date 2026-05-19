@@ -273,6 +273,11 @@ no-build-package = [
   "yarl",
 ]
 
+[tool.uv.workspace]
+members = [
+    "my_project",
+]
+
 [tool.isort]
 py_version = "312"
 skip_glob = ["**/core/rust/*"]

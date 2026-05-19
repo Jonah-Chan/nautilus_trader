@@ -58,6 +58,7 @@ from nautilus_trader.data.messages import UnsubscribeFundingRates
 from nautilus_trader.data.messages import UnsubscribeIndexPrices
 from nautilus_trader.data.messages import UnsubscribeInstrument
 from nautilus_trader.data.messages import UnsubscribeInstruments
+from nautilus_trader.data.messages import UnsubscribeInstrumentStatus
 from nautilus_trader.data.messages import UnsubscribeMarkPrices
 from nautilus_trader.data.messages import UnsubscribeOptionGreeks
 from nautilus_trader.data.messages import UnsubscribeOrderBook
@@ -312,6 +313,29 @@ class OKXDataClient(LiveMarketDataClient):
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         await self._ws_client.subscribe_book_with_depth(pyo3_instrument_id, command.depth)
 
+    async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
+        if command.book_type != BookType.L2_MBP:
+            self._log.warning(
+                f"Book type {book_type_to_str(command.book_type)} not supported by OKX, skipping subscription",
+            )
+            return
+
+        if command.depth not in (0, 5, 10):
+            self._log.error(
+                "Cannot subscribe to order book depth: "
+                f"invalid `depth`, was {command.depth}; "
+                "OKX `books5` supports 5 levels (published as OrderBookDepth10 with empty padding)",
+            )
+            return
+
+        if command.depth == 10:
+            self._log.info(
+                "OKX `books5` provides 5 levels; remaining OrderBookDepth10 levels will be empty",
+            )
+
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.subscribe_book_depth5(pyo3_instrument_id)
+
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         await self._ws_client.subscribe_quotes(pyo3_instrument_id)
@@ -352,6 +376,9 @@ class OKXDataClient(LiveMarketDataClient):
 
     async def _subscribe_instrument_status(self, command: SubscribeInstrumentStatus) -> None:
         pass  # Status changes detected via periodic instrument info polling
+
+    async def _unsubscribe_instrument_status(self, command: UnsubscribeInstrumentStatus) -> None:
+        pass  # Status changes are not subscribed through a per-instrument OKX channel
 
     async def _subscribe_option_greeks(self, command: SubscribeOptionGreeks) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
@@ -436,6 +463,10 @@ class OKXDataClient(LiveMarketDataClient):
 
         if tasks:
             await asyncio.gather(*tasks)
+
+    async def _unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_book_depth5(pyo3_instrument_id)
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)

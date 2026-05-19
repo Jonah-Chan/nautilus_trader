@@ -33,10 +33,11 @@ use nautilus_common::{
             BarsResponse, BookResponse, DataResponse, ForwardPricesResponse, FundingRatesResponse,
             InstrumentResponse, InstrumentsResponse, RequestBars, RequestBookSnapshot,
             RequestForwardPrices, RequestFundingRates, RequestInstrument, RequestInstruments,
-            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeFundingRates,
-            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentStatus,
-            SubscribeInstruments, SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes,
-            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
+            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10,
+            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
+            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, TradesResponse,
+            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
             UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrumentStatus,
             UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
         },
@@ -1080,6 +1081,39 @@ impl DataClient for OKXDataClient {
         Ok(())
     }
 
+    fn subscribe_book_depth10(&mut self, cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
+        if cmd.book_type != BookType::L2_MBP {
+            anyhow::bail!("OKX only supports L2_MBP order book depth");
+        }
+
+        let raw_depth = cmd.depth.map_or(0, |d| d.get());
+        if !matches!(raw_depth, 0 | 5 | 10) {
+            anyhow::bail!(
+                "Invalid depth {raw_depth}, OKX books5 supports 5 levels (published as OrderBookDepth10 with empty padding)"
+            );
+        }
+
+        if raw_depth == 10 {
+            log::info!(
+                "OKX books5 provides 5 levels; remaining OrderBookDepth10 levels will be empty"
+            );
+        }
+
+        let instrument_id = cmd.instrument_id;
+        let ws = self.public_ws()?.clone();
+
+        self.spawn_ws(
+            async move {
+                ws.subscribe_book_depth5(instrument_id)
+                    .await
+                    .context("books5 subscription")
+            },
+            "order book depth10 subscription",
+        );
+
+        Ok(())
+    }
+
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
@@ -1276,6 +1310,21 @@ impl DataClient for OKXDataClient {
                 Ok(())
             },
             "order book unsubscribe",
+        );
+        Ok(())
+    }
+
+    fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
+        let ws = self.public_ws()?.clone();
+        let instrument_id = cmd.instrument_id;
+
+        self.spawn_ws(
+            async move {
+                ws.unsubscribe_book_depth5(instrument_id)
+                    .await
+                    .context("books5 unsubscribe")
+            },
+            "order book depth10 unsubscribe",
         );
         Ok(())
     }
