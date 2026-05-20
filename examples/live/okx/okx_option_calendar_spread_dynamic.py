@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: RUF003
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
@@ -46,6 +47,26 @@ from typing import Any
 
 import pandas as pd
 
+
+try:
+    from examples.live.okx.okx_option_core import OptionInstrumentRecord
+    from examples.live.okx.okx_option_core import OptionSeriesKey
+    from examples.live.okx.okx_option_core import OptionTimeFilter
+    from examples.live.okx.okx_option_core import build_strike_range
+    from examples.live.okx.okx_option_core import candidate_series_keys
+    from examples.live.okx.okx_option_core import normalize_option_instrument
+    from examples.live.okx.okx_option_core import to_decimal
+    from examples.live.okx.okx_option_core import to_pyo3_price
+except ModuleNotFoundError:  # pragma: no cover - supports direct script execution.
+    from okx_option_core import OptionInstrumentRecord
+    from okx_option_core import OptionSeriesKey
+    from okx_option_core import OptionTimeFilter
+    from okx_option_core import build_strike_range
+    from okx_option_core import candidate_series_keys
+    from okx_option_core import normalize_option_instrument
+    from okx_option_core import to_decimal
+    from okx_option_core import to_pyo3_price
+
 from nautilus_trader.adapters.okx import OKX
 from nautilus_trader.adapters.okx import OKXDataClientConfig
 from nautilus_trader.adapters.okx import OKXExecClientConfig
@@ -57,7 +78,6 @@ from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
 from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
 from nautilus_trader.core.nautilus_pyo3 import OKXMarginMode
@@ -74,171 +94,12 @@ from nautilus_trader.model.objects import Price
 from nautilus_trader.trading.strategy import Strategy
 
 
-NS_PER_DAY = 86_400_000_000_000
-
-
-def _code(value: Any) -> str:
-    # Nautilus 的 Currency/Symbol 等对象通常有 code 字段;测试替身或 PyO3 对象可能只有
-    # __str__。统一转成字符串,避免动态发现逻辑绑定到某一个具体 instrument 类型。
-    if hasattr(value, "code"):
-        return str(value.code)
-    return str(value)
-
-
-def _option_kind_code(value: Any) -> str:
-    text = str(getattr(value, "name", value)).upper()
-    if "." in text:
-        text = text.rsplit(".", 1)[-1]
-    if text in {"C", "CALL"}:
-        return "CALL"
-    if text in {"P", "PUT"}:
-        return "PUT"
-    return text
-
-
-def _decimal(value: Any) -> Decimal:
-    if hasattr(value, "as_decimal"):
-        return value.as_decimal()
-    return Decimal(str(value))
-
-
-def _pyo3_price(value: Any) -> nautilus_pyo3.Price:
-    # OptionChainSlice 是 PyO3 暴露出来的对象,get_call_quote/get_put_quote 需要
-    # nautilus_pyo3.Price;Cython Price 不能直接传入。
-    return nautilus_pyo3.Price.from_str(str(value))
-
-
-def _instrument_settlement_currency(instrument: Instrument) -> str:
-    # OKX 期权的 instrument family 形如 BTC-USD/ETH-USD,但 OptionSeriesId 的第三个
-    # 字段是 settlement_currency。对 inverse crypto option,结算币种可能是 BTC/ETH,
-    # 不能简单用 quote_currency=USD 代替。
-    if hasattr(instrument, "get_settlement_currency"):
-        return _code(instrument.get_settlement_currency())
-    if hasattr(instrument, "settlement_currency"):
-        return _code(instrument.settlement_currency)
-    if hasattr(instrument, "currency"):
-        return _code(instrument.currency)
-    if hasattr(instrument, "quote_currency"):
-        return _code(instrument.quote_currency)
-    raise ValueError(f"Cannot resolve settlement currency for {instrument.id}")
-
-
-def _instrument_quote_currency(instrument: Instrument) -> str:
-    if hasattr(instrument, "quote_currency"):
-        return _code(instrument.quote_currency)
-    if hasattr(instrument, "currency"):
-        return _code(instrument.currency)
-    return _instrument_settlement_currency(instrument)
-
-
-def _is_option_instrument(instrument: Instrument) -> bool:
-    return (
-        hasattr(instrument, "option_kind")
-        and hasattr(instrument, "strike_price")
-        and hasattr(instrument, "expiration_ns")
-        and hasattr(instrument, "underlying")
-    )
-
-
-@dataclass(frozen=True)
-class OptionSeriesKey:
-    """
-    Nautilus option-chain 订阅的最小 series 维度。
-
-    OKX 动态发现先在 instrument 层看到每个具体合约,然后必须降维成
-    OptionSeriesId(venue, underlying, settlement_currency, expiration_ns),DataEngine
-    才能为该到期序列维护一组 call/put quote、greeks 和 ATM 附近 strike。
-    """
-
-    venue: Venue
-    underlying_code: str
-    settlement_currency: str
-    expiration_ns: int
-
-    def to_series_id(self) -> nautilus_pyo3.OptionSeriesId:
-        return nautilus_pyo3.OptionSeriesId(
-            str(self.venue),
-            self.underlying_code,
-            self.settlement_currency,
-            self.expiration_ns,
-        )
-
-    def __str__(self) -> str:
-        return (
-            f"{self.venue}-{self.underlying_code}-"
-            f"{self.settlement_currency}-{self.expiration_ns}"
-        )
-
-
-@dataclass(frozen=True)
-class CalendarInstrumentRecord:
-    """
-    从 Nautilus instrument 归一化出来的日历价差候选合约记录。
-
-    这里保存 quote_currency 和 settlement_currency 两个字段,是为了避免把 OKX 的
-    family 命名口径误用成真实结算口径。pair_key 会用二者共同分组,确保 BTC/ETH、
-    USD 计价和币本位结算的合约不会被错误配成一组。
-    """
-
-    instrument_id: InstrumentId
-    venue: Venue
-    underlying_code: str
-    quote_currency: str
-    settlement_currency: str
-    expiration_ns: int
-    activation_ns: int
-    strike_price: Price
-    option_kind: str
-    instrument: Instrument
-
-    @property
-    def series_key(self) -> OptionSeriesKey:
-        return OptionSeriesKey(
-            venue=self.venue,
-            underlying_code=self.underlying_code,
-            settlement_currency=self.settlement_currency,
-            expiration_ns=self.expiration_ns,
-        )
-
-    @property
-    def strike_key(self) -> str:
-        return str(self.strike_price)
-
-    @property
-    def pair_key(self) -> tuple[str, str, str, str, str]:
-        return (
-            self.underlying_code,
-            self.quote_currency,
-            self.settlement_currency,
-            self.option_kind,
-            self.strike_key,
-        )
-
-    def is_live(
-        self,
-        now_ns: int,
-        min_dte_days: int,
-        max_dte_days: int,
-        blackout_minutes: int,
-    ) -> bool:
-        # 过滤尚未激活、临近到期黑窗、以及超出策略关注 DTE 范围的合约。这样动态发现
-        # 不会把已不可交易或即将到期的合约带入 option-chain 订阅和候选组合。
-        if self.activation_ns and self.activation_ns > now_ns:
-            return False
-
-        min_ns = min_dte_days * NS_PER_DAY
-        max_ns = max_dte_days * NS_PER_DAY
-        blackout_ns = blackout_minutes * 60_000_000_000
-        dte_ns = self.expiration_ns - now_ns
-        return dte_ns > blackout_ns and min_ns <= dte_ns <= max_ns
-
-
 @dataclass(frozen=True)
 class CalendarPair:
     # 一个日历价差 pair 总是同 underlying、同结算币种、同 call/put、同行权价,
     # 仅到期日不同:near leg 用近月,far leg 用远月。
-    near: CalendarInstrumentRecord
-    far: CalendarInstrumentRecord
+    near: OptionInstrumentRecord
+    far: OptionInstrumentRecord
 
     @property
     def option_kind(self) -> str:
@@ -272,42 +133,27 @@ class CalendarOpportunity:
     reason: str
 
 
-def normalize_option_instrument(
-    instrument: Instrument,
-    underlyings: tuple[str, ...],
-) -> CalendarInstrumentRecord | None:
-    # 动态发现的入口:从 cache/instrument events 里拿到任意 Instrument,只有具备
-    # option_kind、strike_price、expiration_ns、underlying 的期权合约才会进入候选池。
-    if not _is_option_instrument(instrument):
-        return None
-
-    underlying_code = _code(instrument.underlying).upper()
-    if underlying_code not in {u.upper() for u in underlyings}:
-        return None
-
-    return CalendarInstrumentRecord(
-        instrument_id=instrument.id,
-        venue=instrument.id.venue,
-        underlying_code=underlying_code,
-        quote_currency=_instrument_quote_currency(instrument),
-        settlement_currency=_instrument_settlement_currency(instrument),
-        expiration_ns=int(instrument.expiration_ns),
-        activation_ns=int(getattr(instrument, "activation_ns", 0) or 0),
-        strike_price=instrument.strike_price,
-        option_kind=_option_kind_code(instrument.option_kind),
-        instrument=instrument,
+def calendar_pair_key(record: OptionInstrumentRecord) -> tuple[str, str, str, str, str]:
+    # 日历价差的分组口径:同 underlying、报价币种、结算币种、call/put、行权价,
+    # 只允许到期日不同。这个 key 是策略语义,不属于通用 OptionInstrumentRecord。
+    return (
+        record.underlying_code,
+        record.quote_currency,
+        record.settlement_currency,
+        record.option_kind,
+        record.strike_key,
     )
 
 
 def build_calendar_pairs(
-    records: list[CalendarInstrumentRecord],
+    records: list[OptionInstrumentRecord],
     expiry_pair_mode: str,
 ) -> list[CalendarPair]:
     # 先按业务上必须完全一致的维度分桶,再在每个桶内按到期日排序生成 near/far。
     # all 模式会生成同一 strike 的全部近远月组合;adjacent 只生成相邻到期组合。
-    by_key: dict[tuple[str, str, str, str, str], list[CalendarInstrumentRecord]] = {}
+    by_key: dict[tuple[str, str, str, str, str], list[OptionInstrumentRecord]] = {}
     for record in records:
-        by_key.setdefault(record.pair_key, []).append(record)
+        by_key.setdefault(calendar_pair_key(record), []).append(record)
 
     pairs: list[CalendarPair] = []
     for grouped in by_key.values():
@@ -324,26 +170,6 @@ def build_calendar_pairs(
                 pairs.append(CalendarPair(near=near, far=far))
 
     return pairs
-
-
-def build_strike_range(
-    policy: str,
-    strikes_above: int,
-    strikes_below: int,
-    atm_percent: float,
-    fixed_strikes: tuple[Price, ...] = (),
-) -> nautilus_pyo3.StrikeRange | None:
-    # 默认使用 ATM 附近 strike,避免一启动就订阅全市场所有行权价。只有显式传
-    # all_strikes 时才返回 None,让 DataEngine 使用该 series 的全部 strike。
-    if policy == "atm_relative":
-        return nautilus_pyo3.StrikeRange.atm_relative(strikes_above, strikes_below)
-    if policy == "atm_percent":
-        return nautilus_pyo3.StrikeRange.atm_percent(atm_percent)
-    if policy == "fixed":
-        return nautilus_pyo3.StrikeRange.fixed([_pyo3_price(strike) for strike in fixed_strikes])
-    if policy == "all_strikes":
-        return None
-    raise ValueError(f"Unsupported strike_range_policy: {policy}")
 
 
 def evaluate_calendar_opportunity(
@@ -368,7 +194,7 @@ def evaluate_calendar_opportunity(
         return None
 
     # OptionChainSlice 的 quote lookup 走 PyO3 Price,不能直接使用 Cython Price。
-    chain_strike = _pyo3_price(pair.strike_price)
+    chain_strike = to_pyo3_price(pair.strike_price)
     if pair.option_kind == "CALL":
         near_quote = near_chain.get_call_quote(chain_strike)
         far_quote = far_chain.get_call_quote(chain_strike)
@@ -379,8 +205,8 @@ def evaluate_calendar_opportunity(
     if near_quote is None or far_quote is None:
         return None
 
-    near_bid = _decimal(near_quote.bid_price)
-    far_ask = _decimal(far_quote.ask_price)
+    near_bid = to_decimal(near_quote.bid_price)
+    far_ask = to_decimal(far_quote.ask_price)
     if near_bid <= 0 or far_ask <= 0:
         return None
 
@@ -436,6 +262,7 @@ class DynamicCalendarSpreadConfig(StrategyConfig, frozen=True, kw_only=True):
     atm_strikes_above: int = 3             # atm_relative 模式：ATM 之上保留的行权价档数
     atm_strikes_below: int = 3             # atm_relative 模式：ATM 之下保留的行权价档数
     atm_percent: float = 0.10              # atm_percent 模式：覆盖 ATM ±N% 内的行权价，如 0.10=±10%
+    fixed_strikes: tuple[Price, ...] = ()  # fixed 模式下显式订阅的行权价列表；为空时视为配置错误
 
     # ── 行情刷新与质量控制 ────────────────────────────────────────────────────
     snapshot_interval_ms: int = 2_000      # DataEngine 推送 OptionChainSlice 的最低间隔（毫秒），0=每 tick 推
@@ -458,9 +285,15 @@ class DynamicCalendarSpreadStrategy(Strategy):
         super().__init__(config)
         # _records_by_id 是当前发现到的可交易期权池;它会由 cache 初始化和 instrument
         # 事件增量更新共同维护。
-        self._records_by_id: dict[InstrumentId, CalendarInstrumentRecord] = {}
-        # _subscribed_series 记录已经订阅过的 OptionSeriesId 字符串,避免 refresh 时重复订阅。
-        self._subscribed_series: set[str] = set()
+        self._records_by_id: dict[InstrumentId, OptionInstrumentRecord] = {}
+        # _subscribed_series 保存已订阅的 series key,即使 record 之后被时间过滤清理,
+        # shutdown 或增量退订也不需要再从当前 records 反查。
+        self._subscribed_series: dict[str, OptionSeriesKey] = {}
+        self._time_filter = OptionTimeFilter(
+            min_dte_days=config.min_dte_days,
+            max_dte_days=config.max_dte_days,
+            expiry_blackout_minutes=config.expiry_blackout_minutes,
+        )
         # _latest_chains 保存每个到期序列最新的 OptionChainSlice,机会扫描只在近远月
         # 两个 chain 都可用时进行。
         self._latest_chains: dict[str, Any] = {}
@@ -501,8 +334,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
             self.clock.cancel_timer("dynamic_calendar_refresh")
 
         # 主动退订已订阅的 option chains,保证 live node shutdown 不留下内部订阅状态。
-        for series_key in list(self._subscribed_series):
-            key = self._series_key_from_string(series_key)
+        for key in list(self._subscribed_series.values()):
             self.unsubscribe_option_chain(key.to_series_id(), client_id=ClientId(OKX))
 
     def on_instrument(self, instrument: Instrument) -> None:
@@ -520,7 +352,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
         # 只有真实执行路径会依赖成交事件。两腿都达到目标数量后才认为价差仓位 OPEN;
         # 单腿成交不算成功,因为残腿风险仍然存在。
         instrument_id = event.instrument_id
-        last_qty = _decimal(event.last_qty)
+        last_qty = to_decimal(event.last_qty)
         self._filled_qty_by_instrument[instrument_id] = (
             self._filled_qty_by_instrument.get(instrument_id, Decimal(0)) + last_qty
         )
@@ -564,6 +396,8 @@ class DynamicCalendarSpreadStrategy(Strategy):
             self.log.warning(
                 "dry_run=False without execution_enabled; orders will not be submitted",
             )
+        if self.config.strike_range_policy == "fixed" and not self.config.fixed_strikes:
+            raise ValueError("strike_range_policy='fixed' requires --fixed-strikes")
 
     def _on_refresh_timer(self, event: Any | None = None) -> None:
         self._refresh_from_cache()
@@ -587,17 +421,15 @@ class DynamicCalendarSpreadStrategy(Strategy):
             return False
 
         now_ns = self.clock.timestamp_ns()
-        if not record.is_live(
-            now_ns=now_ns,
-            min_dte_days=self.config.min_dte_days,
-            max_dte_days=self.config.max_dte_days,
-            blackout_minutes=self.config.expiry_blackout_minutes,
-        ):
-            return False
+        if not self._time_filter.allows(record, now_ns):
+            return self._remove_instrument(record.instrument_id)
 
         existing = self._records_by_id.get(record.instrument_id)
         self._records_by_id[record.instrument_id] = record
         return existing != record
+
+    def _remove_instrument(self, instrument_id: InstrumentId) -> bool:
+        return self._records_by_id.pop(instrument_id, None) is not None
 
     def _rebuild_pairs(self) -> None:
         self._pairs = build_calendar_pairs(
@@ -606,17 +438,11 @@ class DynamicCalendarSpreadStrategy(Strategy):
         )
 
     def _candidate_series_keys(self) -> list[OptionSeriesKey]:
-        # 按 underlying/settlement/expiry 稳定排序,方便 live dry-run 限制订阅数量时可复现。
-        keys = sorted(
-            {record.series_key for record in self._records_by_id.values()},
-            key=lambda k: (k.underlying_code, k.settlement_currency, k.expiration_ns),
+        return candidate_series_keys(
+            records=self._records_by_id.values(),
+            policy=self.config.series_subscription_policy,
+            max_count=self.config.max_series_subscriptions,
         )
-        if (
-            self.config.series_subscription_policy == "ranked_active_series"
-            and self.config.max_series_subscriptions > 0
-        ):
-            return keys[: self.config.max_series_subscriptions]
-        return keys
 
     def _sync_option_chain_subscriptions(self) -> None:
         # 订阅的是“到期序列”而不是单个合约。DataEngine 会按 StrikeRange 管理该序列内
@@ -626,9 +452,21 @@ class DynamicCalendarSpreadStrategy(Strategy):
             strikes_above=self.config.atm_strikes_above,
             strikes_below=self.config.atm_strikes_below,
             atm_percent=self.config.atm_percent,
+            fixed_strikes=self.config.fixed_strikes,
         )
-        for key in self._candidate_series_keys():
-            key_str = str(key.to_series_id())
+        candidate_keys = {
+            str(key.to_series_id()): key
+            for key in self._candidate_series_keys()
+        }
+        for key_str, key in list(self._subscribed_series.items()):
+            if key_str in candidate_keys:
+                continue
+            self.unsubscribe_option_chain(key.to_series_id(), client_id=ClientId(OKX))
+            self._subscribed_series.pop(key_str, None)
+            self._latest_chains.pop(key_str, None)
+            self.log.info(f"Unsubscribed inactive option chain series={key}", LogColor.BLUE)
+
+        for key_str, key in candidate_keys.items():
             if key_str in self._subscribed_series:
                 continue
             self.subscribe_option_chain(
@@ -637,7 +475,7 @@ class DynamicCalendarSpreadStrategy(Strategy):
                 snapshot_interval_ms=self.config.snapshot_interval_ms,
                 client_id=ClientId(OKX),
             )
-            self._subscribed_series.add(key_str)
+            self._subscribed_series[key_str] = key
             self.log.info(f"Subscribed option chain series={key}", LogColor.BLUE)
 
     def _scan_opportunities(self) -> None:
@@ -725,16 +563,13 @@ class DynamicCalendarSpreadStrategy(Strategy):
             "State moved to FAILED_NEEDS_FLATTEN; manual or configured flatten is required.",
         )
 
-    def _series_key_from_string(self, series_key: str) -> OptionSeriesKey:
-        for record in self._records_by_id.values():
-            key = record.series_key
-            if str(key.to_series_id()) == series_key:
-                return key
-        raise KeyError(series_key)
-
 
 def _parse_csv_tuple(raw: str) -> tuple[str, ...]:
     return tuple(part.strip().upper() for part in raw.split(",") if part.strip())
+
+
+def _parse_price_tuple(raw: str) -> tuple[Price, ...]:
+    return tuple(Price.from_str(part.strip()) for part in raw.split(",") if part.strip())
 
 
 def _parse_environment(raw: str) -> OKXEnvironment:
@@ -815,6 +650,7 @@ def build_node(args: argparse.Namespace) -> TradingNode:
                 atm_strikes_above=args.atm_strikes_above,
                 atm_strikes_below=args.atm_strikes_below,
                 atm_percent=args.atm_percent,
+                fixed_strikes=_parse_price_tuple(args.fixed_strikes),
                 snapshot_interval_ms=args.snapshot_interval_ms,
                 refresh_interval_secs=args.refresh_interval_secs,
                 stale_quote_ms=args.stale_quote_ms,
@@ -866,6 +702,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atm-strikes-above", type=int, default=3)
     parser.add_argument("--atm-strikes-below", type=int, default=3)
     parser.add_argument("--atm-percent", type=float, default=0.10)
+    parser.add_argument("--fixed-strikes", default="")
     parser.add_argument("--snapshot-interval-ms", type=int, default=2_000)
     parser.add_argument("--refresh-interval-secs", type=int, default=60)
     parser.add_argument("--stale-quote-ms", type=int, default=5_000)

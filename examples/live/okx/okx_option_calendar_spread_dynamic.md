@@ -26,9 +26,9 @@ open_long_cost = far_ask - near_bid
 
 ## 2. 核心数据结构
 
-### `CalendarInstrumentRecord`
+### `OptionInstrumentRecord`
 
-`CalendarInstrumentRecord` 是从 Nautilus `Instrument` 归一化出的单个期权合约记录。策略用它来保留日历价差配对所需的最小字段：
+`OptionInstrumentRecord` 位于同目录的 `okx_option_core.py`，是从 Nautilus `Instrument` 归一化出的单个期权合约记录。它是 OKX 期权策略通用的“合约事实记录”，不再包含日历价差特有的配对逻辑：
 
 - `instrument_id`：真实可下单合约 ID。
 - `venue`：交易所，默认 OKX。
@@ -40,8 +40,12 @@ open_long_cost = far_ask - near_bid
 - `strike_price`：行权价。
 - `option_kind`：归一化后的 `CALL` 或 `PUT`。
 - `instrument`：原始 Nautilus instrument 对象。
+- `series_key`：降维后的 option-chain 订阅键。
+- `strike_key`：用于策略侧自行分组的行权价字符串。
 
 源码刻意同时保存 `quote_currency` 和 `settlement_currency`。OKX option family 形如 `BTC-USD`、`ETH-USD`，但日历价差配对和 `OptionSeriesId` 不能简单把 family 中的 `USD` 当作真实结算币种。对币本位期权，结算币种可能是 BTC/ETH；策略需要把这个维度保留下来，避免把不同结算口径的合约错配。
+
+`OptionInstrumentRecord` 只暴露 `dte_ns(now_ns)`、`dte_days(now_ns)`、`is_activated(now_ns)`、`is_expired(now_ns)` 这类时间事实。DTE 区间、到期黑窗等策略过滤口径由 `OptionTimeFilter` 承接，避免通用 record 被某一种组合策略的参数污染。
 
 ### `OptionSeriesKey`
 
@@ -181,15 +185,15 @@ DISCOVERY | records=<合约记录数> series=<候选 series 数> pairs=<pair 数
 2. 如果记录新增或变化，则 `_rebuild_pairs()`。
 3. 再 `_sync_option_chain_subscriptions()` 补充订阅。
 
-当前实现只会新增或覆盖仍然 live 的 `_records_by_id` 记录。如果一个已进入 `_records_by_id` 的合约后来进入 expiry blackout、过期或状态变为不可用，`_upsert_instrument()` 返回 `False`，但不会从 `_records_by_id` 删除旧记录，也不会动态退订已经不再需要的 option-chain series。这是当前策略的生命周期清理边界。
+当前实现会新增或覆盖仍然满足 `OptionTimeFilter` 的 `_records_by_id` 记录；如果一个已进入 `_records_by_id` 的合约后来进入 expiry blackout、过期或状态变为不可用，`_upsert_instrument()` 会从 `_records_by_id` 删除该记录，并在下一次 `_sync_option_chain_subscriptions()` 中退订不再属于候选集合的 option-chain series。
 
 需要区分三层状态：
 
 1. Nautilus 全局 instrument cache：DataEngine 收到 `Instrument` 后会 `cache.add_instrument()`，按 `instrument.id` 加入或覆盖定义。cache 里的记录表示“系统知道这个合约定义”，不等于该合约当前仍可交易，也不等于策略应该继续把它放进候选池。
 2. DataEngine option-chain manager：框架内部会对 option-chain 做一层保护。例如收到 `InstrumentStatus` 的 `CLOSE` / `NOT_AVAILABLE_FOR_TRADING`，或 quote/greeks 的 `ts_event >= expiration_ns` 时，会从 option-chain manager 中移除对应 instrument 并退订该 instrument 的 quote/greeks。这保护的是框架内部 option-chain 聚合器。
-3. 当前策略自己的候选池：`_records_by_id`、`_pairs`、`_subscribed_series`、`_latest_chains` 是策略自己维护的状态。DataEngine 清理 option-chain manager 不会自动同步删除这些策略字段；当前文件也没有主动 prune 这些字段。
+3. 当前策略自己的候选池：`_records_by_id`、`_pairs`、`_subscribed_series`、`_latest_chains` 是策略自己维护的状态。DataEngine 清理 option-chain manager 不会自动同步删除这些策略字段；当前文件通过 `OptionTimeFilter` 和订阅同步补上策略侧的基础时间生命周期清理。
 
-因此，`self.cache.instruments()` 里仍看到一个过期合约是正常的；策略是否继续使用它，必须看策略自己的生命周期过滤和清理逻辑。当前文件只在新增/覆盖时做 `is_live()` 过滤，没有对已保存记录做删除式清理。
+因此，`self.cache.instruments()` 里仍看到一个过期合约是正常的；策略是否继续使用它，必须看策略自己的生命周期过滤和清理逻辑。当前文件会清理策略候选池与不再活跃的 option-chain series，但不会自动处理已经真实开仓的组合持仓退出。
 
 ### 4.3 期权合约过滤
 
@@ -206,7 +210,7 @@ DISCOVERY | records=<合约记录数> series=<候选 series 数> pairs=<pair 数
 
 ### 4.4 到期与激活过滤
 
-`CalendarInstrumentRecord.is_live()` 负责过滤不可参与策略的合约：
+`OptionTimeFilter.allows(record, now_ns)` 负责过滤不可参与策略的合约：
 
 - 如果 `activation_ns > now_ns`，说明合约尚未激活，跳过。
 - 剩余到期时间必须大于 `expiry_blackout_minutes`。
@@ -224,7 +228,7 @@ DISCOVERY | records=<合约记录数> series=<候选 series 数> pairs=<pair 数
 
 `build_calendar_pairs(records, expiry_pair_mode)` 负责从单合约记录生成 near/far pair。
 
-第一步先按 `pair_key` 分桶：
+第一步先按日历价差策略自己的 `calendar_pair_key(record)` 分桶：
 
 ```text
 (
@@ -237,6 +241,8 @@ DISCOVERY | records=<合约记录数> series=<候选 series 数> pairs=<pair 数
 ```
 
 这个分桶是业务约束：同一个日历价差 pair 内，只允许到期日不同，其余维度必须完全一致。
+
+注意，`calendar_pair_key()` 没有放进 `OptionInstrumentRecord`。这是刻意的边界：跨式、垂直价差、蝶式等策略的分组维度都不同，通用 record 不能内置日历价差的配对语义。
 
 第二步在每个桶内按 `expiration_ns` 从近到远排序。
 
@@ -508,6 +514,7 @@ State moved to FAILED_NEEDS_FLATTEN; manual or configured flatten is required.
 | `--atm-strikes-above` | `3` | ATM 上方档数 |
 | `--atm-strikes-below` | `3` | ATM 下方档数 |
 | `--atm-percent` | `0.10` | ATM 百分比范围 |
+| `--fixed-strikes` | 空 | `fixed` strike range 模式下的显式行权价列表 |
 | `--snapshot-interval-ms` | `2000` | OptionChainSlice 推送间隔 |
 | `--refresh-interval-secs` | `60` | cache 重扫、pair 重建、订阅同步间隔 |
 | `--stale-quote-ms` | `5000` | 单个 chain slice 最大允许年龄 |
@@ -530,7 +537,7 @@ flowchart TD
     C --> D["Strategy.on_start()"]
     D --> E["_refresh_from_cache()"]
     E --> F["normalize_option_instrument()"]
-    F --> G["CalendarInstrumentRecord.is_live()"]
+    F --> G["OptionTimeFilter.allows(record, now_ns)"]
     G --> H["_rebuild_pairs()"]
     H --> I["_sync_option_chain_subscriptions()"]
     I --> J["subscribe_option_chain(OptionSeriesId, StrikeRange)"]
@@ -559,6 +566,8 @@ flowchart TD
 - BTC/ETH 期权动态发现。
 - OKX option family 显式加载。
 - 基于 cache 和 instrument event 的增量更新。
+- 基于 `OptionTimeFilter` 的候选池过期/黑窗清理。
+- 不再活跃 option-chain series 的运行期退订。
 - 按 same underlying、same settlement、same type、same strike 构造 near/far 日历 pair。
 - 按 `OptionSeriesId` 订阅 option-chain。
 - 基于 `OptionChainSlice` 的同 strike bid/ask 候选评估。
@@ -568,8 +577,6 @@ flowchart TD
 
 这份策略文件当前没有实现：
 
-- 对 `_records_by_id`、`_pairs`、`_subscribed_series`、`_latest_chains` 的过期合约主动清理。
-- 对不再需要的 option-chain series 做运行期退订。
 - 机会收益阈值、费用模型、滑点模型。
 - L2 深度或 VWAP 可成交量校验。
 - 按 IV、Greeks、期限结构进行信号过滤。
@@ -579,6 +586,5 @@ flowchart TD
 - 自动 flatten 残腿。
 - 已开仓组合的止盈、止损、到期前平仓、roll 或持仓生命周期管理。
 - 持久化状态恢复。
-- `fixed` strike mode 的命令行固定行权价输入。
 
 因此，当前文件更准确的定位是“动态日历价差发现 + dry-run 可执行参数生成 + 最小真实执行骨架”，不是完整生产级期权日历价差交易系统。

@@ -115,7 +115,7 @@ class OptionGreeksTester(Actor):
         self.log.info(
             f"GREEKS {greeks.instrument_id}: "
             f"convention={greeks.convention} "
-            f"delta={greeks.delta:.4f} gamma={greeks.gamma:.6f} "
+            f"delta={greeks.delta:.4f} gamma={greeks.gamma:.8f} "
             f"vega={greeks.vega:.4f} theta={greeks.theta:.4f} "
             f"mark_iv={greeks.mark_iv} bid_iv={greeks.bid_iv} ask_iv={greeks.ask_iv} "
             f"underlying={greeks.underlying_price} oi={greeks.open_interest}",
@@ -136,7 +136,7 @@ config_node = TradingNodeConfig(
     ),
     data_clients={
         OKX: OKXDataClientConfig(
-            environment=OKXEnvironment.DEMO,
+            environment=OKXEnvironment.LIVE,
             instrument_provider=InstrumentProviderConfig(load_all=True),
             instrument_types=(OKXInstrumentType.OPTION,),
             instrument_families=("BTC-USD",),
