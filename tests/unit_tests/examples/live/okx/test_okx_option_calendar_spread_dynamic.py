@@ -13,14 +13,20 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pandas as pd
+import pytest
 
 from examples.live.okx.okx_option_calendar_spread_dynamic import build_calendar_pairs
-from examples.live.okx.okx_option_calendar_spread_dynamic import build_strike_range
+from examples.live.okx.okx_option_calendar_spread_dynamic import calendar_pair_key
 from examples.live.okx.okx_option_calendar_spread_dynamic import evaluate_calendar_opportunity
-from examples.live.okx.okx_option_calendar_spread_dynamic import normalize_option_instrument
+from examples.live.okx.okx_option_core import NS_PER_DAY
+from examples.live.okx.okx_option_core import OptionTimeFilter
+from examples.live.okx.okx_option_core import build_strike_range
+from examples.live.okx.okx_option_core import normalize_option_instrument
+from examples.live.okx.okx_option_core import normalize_option_kind
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.model.currencies import BTC
 from nautilus_trader.model.currencies import ETH
@@ -155,6 +161,60 @@ def test_normalize_crypto_option_uses_currency_underlying_code_and_settlement_cu
     )
 
 
+def test_option_time_filter_keeps_policy_outside_instrument_record():
+    # OptionInstrumentRecord 只暴露时间事实;DTE/blackout 等策略口径由外部 filter 承接。
+    record = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+    now_ns = JUN_EXPIRY - (10 * NS_PER_DAY)
+    time_filter = OptionTimeFilter(
+        min_dte_days=1,
+        max_dte_days=30,
+        expiry_blackout_minutes=60,
+    )
+
+    assert record.dte_ns(now_ns) == 10 * NS_PER_DAY
+    assert record.dte_days(now_ns) == Decimal(10)
+    assert time_filter.allows(record, now_ns)
+    assert not hasattr(record, "is_live")
+    assert not time_filter.allows(replace(record, activation_ns=now_ns + 1), now_ns)
+    assert not time_filter.allows(replace(record, expiration_ns=now_ns - 1), now_ns)
+    assert not time_filter.allows(replace(record, expiration_ns=now_ns + NS_PER_DAY * 31), now_ns)
+
+
+def test_option_time_filter_rejects_expiry_blackout_window():
+    record = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+    now_ns = JUN_EXPIRY - (30 * 60_000_000_000)
+    time_filter = OptionTimeFilter(
+        min_dte_days=0,
+        max_dte_days=30,
+        expiry_blackout_minutes=60,
+    )
+
+    assert not time_filter.allows(record, now_ns)
+
+
+def test_calendar_pair_key_stays_calendar_strategy_specific():
+    record = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+
+    assert calendar_pair_key(record) == ("BTC", "USD", "USD", "CALL", "70000")
+    assert not hasattr(record, "pair_key")
+
+
+def test_normalize_option_kind_fails_closed_for_unknown_kind():
+    assert normalize_option_kind("C") == "CALL"
+    assert normalize_option_kind(OptionKind.PUT) == "PUT"
+    with pytest.raises(ValueError, match="Unsupported option kind"):
+        normalize_option_kind("BINARY")
+
+
 def test_build_calendar_pairs_all_mode_generates_all_near_far_expiry_pairs():
     # all 模式应该为同一 underlying/strike/kind 的 N 个到期日生成 N*(N-1)/2 个
     # near/far 组合,而不是只取最近两个到期日。
@@ -228,6 +288,26 @@ def test_all_strikes_policy_is_explicit():
     )
 
     assert strike_range is None
+
+
+def test_fixed_strike_range_requires_explicit_strikes():
+    with pytest.raises(ValueError, match="requires at least one fixed strike"):
+        build_strike_range(
+            policy="fixed",
+            strikes_above=3,
+            strikes_below=3,
+            atm_percent=0.10,
+        )
+
+    strike_range = build_strike_range(
+        policy="fixed",
+        strikes_above=3,
+        strikes_below=3,
+        atm_percent=0.10,
+        fixed_strikes=(Price.from_str("70000"),),
+    )
+
+    assert strike_range is not None
 
 
 def test_opportunity_emits_executable_dry_run_leg_parameters_from_bid_ask():
