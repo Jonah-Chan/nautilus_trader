@@ -127,8 +127,7 @@ class OptionSeriesKey:
 
     def __str__(self) -> str:
         return (
-            f"{self.venue}-{self.underlying_code}-"
-            f"{self.settlement_currency}-{self.expiration_ns}"
+            f"{self.venue}-{self.underlying_code}-{self.settlement_currency}-{self.expiration_ns}"
         )
 
 
@@ -136,7 +135,6 @@ class OptionSeriesKey:
 class OptionInstrumentRecord:
     """
     从 Nautilus instrument 归一化出来的通用期权合约记录。
-
     该 record 只保存合约事实和轻量派生值;DTE、黑窗和流动性等策略过滤口径
     放在外部 filter 中,避免通用 record 被日历价差或其他组合策略的参数污染。
     """
@@ -182,7 +180,6 @@ class OptionInstrumentRecord:
 class OptionTimeFilter:
     """
     通用的时间维度过滤器。
-
     更复杂的策略过滤,例如 moneyness、成交量、盘口深度或 Greeks 条件,应由具体策略
     在此 filter 之后继续叠加,不要继续塞进 OptionInstrumentRecord。
     """

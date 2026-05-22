@@ -19,15 +19,23 @@ from decimal import Decimal
 import pandas as pd
 import pytest
 
+from examples.live.okx.okx_option_calendar_spread_dynamic import CalendarBasketLifecycle
+from examples.live.okx.okx_option_calendar_spread_dynamic import CalendarBasketState
 from examples.live.okx.okx_option_calendar_spread_dynamic import build_calendar_pairs
+from examples.live.okx.okx_option_calendar_spread_dynamic import build_close_legs
+from examples.live.okx.okx_option_calendar_spread_dynamic import build_close_legs_from_quotes
+from examples.live.okx.okx_option_calendar_spread_dynamic import build_node_components
 from examples.live.okx.okx_option_calendar_spread_dynamic import calendar_pair_key
 from examples.live.okx.okx_option_calendar_spread_dynamic import evaluate_calendar_opportunity
+from examples.live.okx.okx_option_calendar_spread_dynamic import parse_args
 from examples.live.okx.okx_option_core import NS_PER_DAY
 from examples.live.okx.okx_option_core import OptionTimeFilter
 from examples.live.okx.okx_option_core import build_strike_range
 from examples.live.okx.okx_option_core import normalize_option_instrument
 from examples.live.okx.okx_option_core import normalize_option_kind
+from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
 from nautilus_trader.model.currencies import BTC
 from nautilus_trader.model.currencies import ETH
 from nautilus_trader.model.currencies import USD
@@ -418,3 +426,216 @@ def test_opportunity_fails_closed_when_cross_series_snapshot_skew_is_too_large()
     )
 
     assert opportunity is None
+
+
+def test_close_legs_use_executable_reverse_sides_and_reduce_only():
+    near = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+    far = normalize_option_instrument(
+        _okx_option("BTC-USD-260925-70000-C", BTC, SEP_EXPIRY),
+        ("BTC",),
+    )
+    pair = build_calendar_pairs([near, far], expiry_pair_mode="all")[0]
+    now_ns = 1_000_000_000_000
+    near_chain = FakeChain(
+        ts_event=now_ns,
+        calls={near.strike_price: _quote(near.instrument_id, "0.10", "0.11", now_ns)},
+    )
+    far_chain = FakeChain(
+        ts_event=now_ns,
+        calls={far.strike_price: _quote(far.instrument_id, "0.14", "0.15", now_ns)},
+    )
+    opportunity = evaluate_calendar_opportunity(
+        pair=pair,
+        near_chain=near_chain,
+        far_chain=far_chain,
+        now_ns=now_ns,
+        stale_quote_ms=5_000,
+        max_cross_series_skew_ms=1_000,
+        order_qty=Decimal(1),
+        time_in_force=TimeInForce.IOC,
+    )
+
+    close_legs = build_close_legs(opportunity, near_chain, far_chain, TimeInForce.IOC)
+
+    assert close_legs is not None
+    near_close, far_close = close_legs
+    assert near_close.role == "close_buy_near"
+    assert near_close.side == OrderSide.BUY
+    assert near_close.limit_price == Decimal("0.11")
+    assert near_close.reduce_only
+    assert far_close.role == "close_sell_far"
+    assert far_close.side == OrderSide.SELL
+    assert far_close.limit_price == Decimal("0.14")
+    assert far_close.reduce_only
+
+
+def test_close_legs_can_use_direct_leg_quote_ticks_when_chain_slice_drops_strike():
+    near = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+    far = normalize_option_instrument(
+        _okx_option("BTC-USD-260925-70000-C", BTC, SEP_EXPIRY),
+        ("BTC",),
+    )
+    pair = build_calendar_pairs([near, far], expiry_pair_mode="all")[0]
+    now_ns = 1_000_000_000_000
+    near_chain = FakeChain(
+        ts_event=now_ns,
+        calls={near.strike_price: _quote(near.instrument_id, "0.10", "0.11", now_ns)},
+    )
+    far_chain = FakeChain(
+        ts_event=now_ns,
+        calls={far.strike_price: _quote(far.instrument_id, "0.14", "0.15", now_ns)},
+    )
+    opportunity = evaluate_calendar_opportunity(
+        pair=pair,
+        near_chain=near_chain,
+        far_chain=far_chain,
+        now_ns=now_ns,
+        stale_quote_ms=5_000,
+        max_cross_series_skew_ms=1_000,
+        order_qty=Decimal(1),
+        time_in_force=TimeInForce.IOC,
+    )
+
+    close_legs = build_close_legs_from_quotes(
+        opportunity=opportunity,
+        near_quote=_quote(near.instrument_id, "0.10", "0.12", now_ns),
+        far_quote=_quote(far.instrument_id, "0.13", "0.15", now_ns),
+        time_in_force=TimeInForce.IOC,
+    )
+
+    assert close_legs is not None
+    near_close, far_close = close_legs
+    assert near_close.side == OrderSide.BUY
+    assert near_close.limit_price == Decimal("0.12")
+    assert near_close.reduce_only
+    assert far_close.side == OrderSide.SELL
+    assert far_close.limit_price == Decimal("0.13")
+    assert far_close.reduce_only
+
+
+def test_calendar_basket_lifecycle_requires_all_open_and_close_fills():
+    near = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+    far = normalize_option_instrument(
+        _okx_option("BTC-USD-260925-70000-C", BTC, SEP_EXPIRY),
+        ("BTC",),
+    )
+    pair = build_calendar_pairs([near, far], expiry_pair_mode="all")[0]
+    now_ns = 1_000_000_000_000
+    near_chain = FakeChain(
+        ts_event=now_ns,
+        calls={near.strike_price: _quote(near.instrument_id, "0.10", "0.11", now_ns)},
+    )
+    far_chain = FakeChain(
+        ts_event=now_ns,
+        calls={far.strike_price: _quote(far.instrument_id, "0.14", "0.15", now_ns)},
+    )
+    opportunity = evaluate_calendar_opportunity(
+        pair=pair,
+        near_chain=near_chain,
+        far_chain=far_chain,
+        now_ns=now_ns,
+        stale_quote_ms=5_000,
+        max_cross_series_skew_ms=1_000,
+        order_qty=Decimal(1),
+        time_in_force=TimeInForce.IOC,
+    )
+    lifecycle = CalendarBasketLifecycle()
+
+    lifecycle.mark_scanning()
+    assert lifecycle.state == CalendarBasketState.SCANNING
+    lifecycle.begin_open(opportunity)
+    assert lifecycle.state == CalendarBasketState.OPENING
+    assert lifecycle.record_fill(near.instrument_id, Decimal(1), now_ns) == CalendarBasketState.OPENING
+    assert lifecycle.record_fill(far.instrument_id, Decimal(1), now_ns) == CalendarBasketState.OPEN
+
+    close_legs = build_close_legs(opportunity, near_chain, far_chain, TimeInForce.IOC)
+    lifecycle.begin_close(close_legs)
+    assert lifecycle.state == CalendarBasketState.CLOSING
+    assert lifecycle.record_fill(near.instrument_id, Decimal(1), now_ns + 1) == CalendarBasketState.CLOSING
+    assert lifecycle.record_fill(far.instrument_id, Decimal(1), now_ns + 1) == CalendarBasketState.FLAT
+    assert lifecycle.can_submit_open()
+
+
+def test_calendar_basket_lifecycle_terminal_partial_fill_requires_flatten():
+    near = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+    far = normalize_option_instrument(
+        _okx_option("BTC-USD-260925-70000-C", BTC, SEP_EXPIRY),
+        ("BTC",),
+    )
+    pair = build_calendar_pairs([near, far], expiry_pair_mode="all")[0]
+    now_ns = 1_000_000_000_000
+    near_chain = FakeChain(
+        ts_event=now_ns,
+        calls={near.strike_price: _quote(near.instrument_id, "0.10", "0.11", now_ns)},
+    )
+    far_chain = FakeChain(
+        ts_event=now_ns,
+        calls={far.strike_price: _quote(far.instrument_id, "0.14", "0.15", now_ns)},
+    )
+    opportunity = evaluate_calendar_opportunity(
+        pair=pair,
+        near_chain=near_chain,
+        far_chain=far_chain,
+        now_ns=now_ns,
+        stale_quote_ms=5_000,
+        max_cross_series_skew_ms=1_000,
+        order_qty=Decimal(1),
+        time_in_force=TimeInForce.IOC,
+    )
+    lifecycle = CalendarBasketLifecycle()
+
+    lifecycle.begin_open(opportunity)
+    lifecycle.record_fill(near.instrument_id, Decimal(1), now_ns)
+
+    assert lifecycle.record_terminal_without_full_fill() == CalendarBasketState.FAILED_NEEDS_FLATTEN
+    assert not lifecycle.can_submit_open()
+
+
+def test_build_node_components_defaults_to_live_data_and_system_sandbox_execution():
+    args = parse_args(["--enable-execution", "--no-dry-run"])
+
+    node_config, strategy_config = build_node_components(args)
+
+    data_config = node_config.data_clients["OKX"]
+    exec_config = node_config.exec_clients["OKX"]
+    assert data_config.environment == OKXEnvironment.LIVE
+    assert isinstance(exec_config, SandboxExecutionClientConfig)
+    assert exec_config.venue == "OKX"
+    assert exec_config.account_type == "MARGIN"
+    assert exec_config.oms_type == "NETTING"
+    assert exec_config.starting_balances == ["10 BTC", "100 ETH", "1000000 USD"]
+    assert exec_config.use_reduce_only
+    assert strategy_config.instrument_family_codes == ("BTC-USD", "ETH-USD")
+    assert not strategy_config.dry_run
+    assert strategy_config.execution_enabled
+
+
+def test_build_node_components_accepts_custom_sandbox_starting_balances():
+    args = parse_args(
+        [
+            "--enable-execution",
+            "--no-dry-run",
+            "--sandbox-starting-balances",
+            "2 BTC,20 ETH,500000 USD",
+            "--sandbox-default-leverage",
+            "2",
+        ],
+    )
+
+    node_config, _ = build_node_components(args)
+
+    exec_config = node_config.exec_clients["OKX"]
+    assert exec_config.starting_balances == ["2 BTC", "20 ETH", "500000 USD"]
+    assert exec_config.default_leverage == Decimal(2)

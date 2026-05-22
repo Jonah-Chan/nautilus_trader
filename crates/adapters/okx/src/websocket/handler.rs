@@ -349,13 +349,17 @@ impl OKXWsFeedHandler {
                     }
                 }
             }
-            OKXWsChannel::Instruments => match serde_json::from_value::<Vec<OKXInstrument>>(data) {
-                Ok(instruments) => Some(OKXWsMessage::Instruments(instruments)),
-                Err(e) => {
-                    log::error!("Failed to parse instruments data: {e}");
-                    None
+            OKXWsChannel::Instruments => {
+                let mut data = data;
+                normalize_okx_duplicate_aliases(&mut data);
+                match serde_json::from_value::<Vec<OKXInstrument>>(data) {
+                    Ok(instruments) => Some(OKXWsMessage::Instruments(instruments)),
+                    Err(e) => {
+                        log::error!("Failed to parse instruments data: {e}");
+                        None
+                    }
                 }
-            },
+            }
             _ => Some(OKXWsMessage::ChannelData {
                 channel,
                 inst_id,
@@ -577,6 +581,26 @@ impl OKXWsFeedHandler {
     }
 }
 
+fn normalize_okx_duplicate_aliases(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("instCategory") {
+                map.remove("category");
+            }
+
+            for value in map.values_mut() {
+                normalize_okx_duplicate_aliases(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                normalize_okx_duplicate_aliases(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Returns `true` when an OKX WebSocket error payload represents a post-only rejection.
 pub fn is_post_only_rejection(code: &str, data: &[Value]) -> bool {
     use crate::common::consts::OKX_POST_ONLY_ERROR_CODE;
@@ -679,5 +703,24 @@ mod tests {
     fn test_is_post_only_rejection_false_for_unrelated_error() {
         let data = vec![json!({ "sMsg": "Insufficient balance" })];
         assert!(!is_post_only_rejection("50000", &data));
+    }
+
+    #[rstest]
+    fn test_normalize_okx_duplicate_aliases_removes_category_when_inst_category_exists() {
+        let mut value = json!({
+            "data": [
+                {
+                    "category": "",
+                    "instCategory": "1",
+                    "instId": "BTC-USD-260524-77500-C"
+                }
+            ]
+        });
+
+        normalize_okx_duplicate_aliases(&mut value);
+
+        let instrument = &value["data"][0];
+        assert!(instrument.get("category").is_none());
+        assert_eq!(instrument["instCategory"], "1");
     }
 }

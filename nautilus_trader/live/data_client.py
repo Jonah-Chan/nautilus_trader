@@ -79,6 +79,49 @@ from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import Venue
 
 
+_BATCHABLE_SUBSCRIPTION_SUCCESS_SUFFIXES = (
+    "option greeks",
+    "instrument status",
+    "quotes",
+)
+
+
+def _parse_batchable_subscription_success_msg(
+    success_msg: str,
+) -> tuple[str, str, str] | None:
+    success_msg = success_msg.strip()
+    for action in ("Subscribed", "Unsubscribed"):
+        prefix = f"{action} "
+        if not success_msg.startswith(prefix):
+            continue
+
+        for data_name in _BATCHABLE_SUBSCRIPTION_SUCCESS_SUFFIXES:
+            suffix = f" {data_name}"
+            if not success_msg.endswith(suffix):
+                continue
+
+            instrument_id = success_msg[len(prefix) : -len(suffix)]
+            if instrument_id:
+                return action, data_name, instrument_id
+
+    return None
+
+
+def _format_batched_subscription_success_msg(
+    action: str,
+    data_name: str,
+    instrument_ids: list[str],
+) -> str:
+    if len(instrument_ids) == 1:
+        return f"{action} {instrument_ids[0]} {data_name}"
+
+    preview = ", ".join(instrument_ids[:3])
+    if len(instrument_ids) > 3:
+        preview = f"{preview}, ..."
+
+    return f"{action} {len(instrument_ids)} instruments {data_name} ({preview})"
+
+
 class LiveDataClient(DataClient):
     """
     The base class for all live data clients.
@@ -374,6 +417,8 @@ class LiveMarketDataClient(MarketDataClient):
         self._is_sync = is_sync
         self._tasks: WeakSet[asyncio.Task] = WeakSet()
         self._disconnect_task: asyncio.Task | None = None
+        self._batched_subscription_success_logs: dict[tuple[str, str], list[str]] = {}
+        self._batched_subscription_success_log_handles: dict[tuple[str, str], asyncio.Handle] = {}
 
         if self._is_sync:
             self._log.warning(
@@ -527,7 +572,41 @@ class LiveMarketDataClient(MarketDataClient):
                     )
 
             if success_msg:
-                self._log.info(success_msg, success_color)
+                self._log_success(success_msg, success_color)
+
+    def _log_success(self, success_msg: str, success_color: LogColor) -> None:
+        parsed = _parse_batchable_subscription_success_msg(success_msg)
+        if parsed is None or self._is_sync or not self._loop or not self._loop.is_running():
+            self._log.info(success_msg, success_color)
+            return
+
+        action, data_name, instrument_id = parsed
+        key = (action, data_name)
+        self._batched_subscription_success_logs.setdefault(key, []).append(instrument_id)
+
+        if key not in self._batched_subscription_success_log_handles:
+            self._batched_subscription_success_log_handles[key] = self._loop.call_later(
+                0.1,
+                self._flush_batched_subscription_success_log,
+                key,
+                success_color,
+            )
+
+    def _flush_batched_subscription_success_log(
+        self,
+        key: tuple[str, str],
+        success_color: LogColor,
+    ) -> None:
+        self._batched_subscription_success_log_handles.pop(key, None)
+        instrument_ids = self._batched_subscription_success_logs.pop(key, [])
+        if not instrument_ids:
+            return
+
+        action, data_name = key
+        self._log.info(
+            _format_batched_subscription_success_msg(action, data_name, instrument_ids),
+            success_color,
+        )
 
     def connect(self) -> None:
         """
@@ -669,7 +748,7 @@ class LiveMarketDataClient(MarketDataClient):
         self.create_task(
             self._subscribe_instrument_status(command),
             log_msg=f"subscribe: instrument_status {command.instrument_id}",
-            success_msg=f"Subscribed {command.instrument_id} instrument status ",
+            success_msg=f"Subscribed {command.instrument_id} instrument status",
             success_color=LogColor.BLUE,
         )
 

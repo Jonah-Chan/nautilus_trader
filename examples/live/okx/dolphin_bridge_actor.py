@@ -48,7 +48,7 @@ We bridge this gap with a ``queue.Queue`` (stdlib thread-safe FIFO):
 
 Error handling
 --------------
-- **DolphinDB connection failure**: Logged and retried with exponential backoff.
+- **DolphinDB connection failure**: Logged and retried on a fixed timer.
 - **Callback exceptions**: Caught and logged (never propagated to the C++ thread).
 - **Queue overflow**: When ``maxsize`` is hit, oldest items are discarded with
   a warning.
@@ -56,17 +56,23 @@ Error handling
 
 from __future__ import annotations
 
+import math
 import queue
 import time
+from collections.abc import Iterable
+from contextlib import suppress
+from datetime import datetime
+from datetime import timedelta
+from numbers import Real
 from typing import Any
 
+from dolphin_factor_types import DOLPHIN_FACTOR_DATA_TYPE
 from dolphin_factor_types import DolphinDBConfig
 from dolphin_factor_types import DolphinFactor
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.config import ActorConfig
-from nautilus_trader.model.data import DataType
 from nautilus_trader.model.identifiers import InstrumentId
 
 
@@ -113,20 +119,26 @@ class DolphinDBBridgeActor(Actor):
         self._overflow_count: int = 0
         self._received_count: int = 0
         self._published_count: int = 0
+        self._decode_error_count: int = 0
+        self._last_event_ts: int = 0
+        self._last_publish_ts: int = 0
+        self._error_queue: queue.Queue[str] = queue.Queue(maxsize=100)
 
     # -- LIFECYCLE ----------------------------------------------------------------
 
     def on_start(self) -> None:
         """Connect to DolphinDB and start streaming subscription."""
-        self._connect_dolphindb()
+        connected = self._connect_dolphindb()
 
         # Start drain timer — runs on the event-loop thread
-        drain_interval_ns = self._dolphin_config.drain_interval_ms * 1_000_000
         self.clock.set_timer(
             name="dolphin_drain",
-            interval_ns=drain_interval_ns,
+            interval=timedelta(milliseconds=self._dolphin_config.drain_interval_ms),
             callback=self._drain_queue,
         )
+
+        if not connected:
+            self._schedule_reconnect()
 
         self.log.info(
             f"DolphinDB bridge started | drain_interval={self._dolphin_config.drain_interval_ms}ms",
@@ -135,7 +147,10 @@ class DolphinDBBridgeActor(Actor):
 
     def on_stop(self) -> None:
         """Unsubscribe and disconnect from DolphinDB."""
-        self.clock.cancel_timer("dolphin_drain")
+        with suppress(Exception):
+            self.clock.cancel_timer("dolphin_reconnect")
+        with suppress(Exception):
+            self.clock.cancel_timer("dolphin_drain")
 
         self._unsubscribe_dolphindb()
         self._disconnect_dolphindb()
@@ -147,13 +162,14 @@ class DolphinDBBridgeActor(Actor):
             f"DolphinDB bridge stopped | "
             f"received={self._received_count}, "
             f"published={self._published_count}, "
-            f"overflows={self._overflow_count}",
+            f"overflows={self._overflow_count}, "
+            f"decode_errors={self._decode_error_count}",
             LogColor.YELLOW,
         )
 
     # -- DOLPHINDB CONNECTION -----------------------------------------------------
 
-    def _connect_dolphindb(self) -> None:
+    def _connect_dolphindb(self) -> bool:
         """Establish connection and subscribe to the streaming table."""
         try:
             import dolphindb as ddb
@@ -162,41 +178,78 @@ class DolphinDBBridgeActor(Actor):
                 "dolphindb package not installed. "
                 "Install with: pip install dolphindb",
             )
-            return
+            return False
 
         cfg = self._dolphin_config
 
         self.log.info(
-            f"Connecting to DolphinDB at {cfg.host}:{cfg.port}...",
+            f"Connecting to DolphinDB at {cfg.host}:{cfg.port} as user '{cfg.username}'...",
             LogColor.BLUE,
         )
 
-        self._session = ddb.session()
-        self._session.connect(cfg.host, cfg.port, cfg.username, cfg.password)
-        self._session.enableStreaming(cfg.streaming_port)
+        try:
+            self._session = ddb.session()
+            connected = self._session.connect(cfg.host, cfg.port, cfg.username, cfg.password)
+            if not connected:
+                raise ConnectionError("DolphinDB session.connect returned False")
+            self._session.enableStreaming(cfg.streaming_port)
+        except Exception as e:
+            self._session = None
+            self.log.error(f"DolphinDB connection failed for {cfg.host}:{cfg.port}: {e}")
+            return False
 
         self.log.info("DolphinDB session connected", LogColor.GREEN)
 
-        # Subscribe to the stream table
-        self._session.subscribe(
-            host=cfg.host,
-            port=cfg.port,
-            handler=self._dolphin_callback,
-            tableName=cfg.table_name,
-            actionName=cfg.action_name,
-            offset=-1,          # Start from latest
-            resub=True,         # Auto-reconnect on disconnect
-            msgAsTable=True,    # Receive rows as pandas DataFrame
-            batchSize=cfg.batch_size,
-            throttle=cfg.throttle,
-        )
-        self._subscribed = True
+        try:
+            self._session.subscribe(
+                host=cfg.host,
+                port=cfg.port,
+                handler=self._dolphin_callback,
+                tableName=cfg.table_name,
+                actionName=cfg.action_name,
+                offset=-1,          # Start from latest
+                resub=True,         # Auto-reconnect on disconnect
+                msgAsTable=True,    # Receive rows as pandas DataFrame
+                batchSize=cfg.batch_size,
+                throttle=cfg.throttle,
+            )
+            self._subscribed = True
+        except Exception as e:
+            self.log.error(
+                f"DolphinDB subscription failed for table '{cfg.table_name}' "
+                f"at {cfg.host}:{cfg.port}: {e}",
+            )
+            self._disconnect_dolphindb()
+            return False
 
         self.log.info(
             f"Subscribed to DolphinDB stream table '{cfg.table_name}' "
             f"(action='{cfg.action_name}', batch_size={cfg.batch_size})",
             LogColor.GREEN,
         )
+        with suppress(Exception):
+            self.clock.cancel_timer("dolphin_reconnect")
+        return True
+
+    def _schedule_reconnect(self) -> None:
+        with suppress(Exception):
+            self.clock.cancel_timer("dolphin_reconnect")
+        self.clock.set_timer(
+            name="dolphin_reconnect",
+            interval=timedelta(seconds=self._dolphin_config.reconnect_delay_secs),
+            callback=self._on_reconnect_timer,
+        )
+        self.log.warning(
+            f"DolphinDB bridge will retry connection every "
+            f"{self._dolphin_config.reconnect_delay_secs:.1f}s",
+        )
+
+    def _on_reconnect_timer(self, event: Any) -> None:
+        if self._subscribed:
+            with suppress(Exception):
+                self.clock.cancel_timer("dolphin_reconnect")
+            return
+        self._connect_dolphindb()
 
     def _unsubscribe_dolphindb(self) -> None:
         """Unsubscribe from the DolphinDB stream table."""
@@ -240,11 +293,10 @@ class DolphinDBBridgeActor(Actor):
         (log, publish_data, cache, etc.). It only enqueues data into the
         thread-safe queue.
 
-        Expected table columns:
-        - ts       : TIMESTAMP — event timestamp from DolphinDB
-        - instrument : SYMBOL  — instrument identifier string
-        - factor_name : SYMBOL — factor name
-        - factor_value : DOUBLE — computed factor value
+        Supported table shapes:
+        - Narrow factors: timestamp/instrument/factor_name/factor_value columns.
+        - Wide surface snapshots: one timestamp/instrument plus multiple numeric
+          factor columns. Each numeric factor column is published separately.
 
         Parameters
         ----------
@@ -252,38 +304,182 @@ class DolphinDBBridgeActor(Actor):
             A batch of rows from the DolphinDB stream table.
 
         """
+        ts_init = int(time.time_ns())
+
         try:
-            ts_init = int(time.time_ns())
+            rows = table.iterrows()
+        except AttributeError:
+            self._enqueue_decode_error("DolphinDB callback expected a DataFrame-like table")
+            return
 
-            for _, row in table.iterrows():
-                # Convert DolphinDB TIMESTAMP (ms epoch) to nanoseconds
-                ts_event = int(row["ts"].timestamp() * 1_000_000_000)
+        for _, row in rows:
+            try:
+                for factor in self._factors_from_row(row, ts_init):
+                    self._enqueue_factor(factor)
+            except Exception as e:
+                self._enqueue_decode_error(f"DolphinDB factor decode failed: {type(e).__name__}: {e}")
 
-                factor = DolphinFactor(
-                    instrument_id=InstrumentId.from_str(str(row["instrument"])),
-                    factor_name=str(row["factor_name"]),
-                    factor_value=float(row["factor_value"]),
-                    ts_event=ts_event,
-                    ts_init=ts_init,
-                )
+    def _factors_from_row(self, row: Any, ts_init: int) -> Iterable[DolphinFactor]:
+        cfg = self._dolphin_config
+        ts_event = self._extract_ts_event(row)
+        instrument_id = self._extract_instrument_id(row)
 
+        if self._has_value(row, cfg.factor_value_column):
+            factor_name = str(self._get_value(row, cfg.factor_name_column, cfg.default_factor_name))
+            factor_value = self._as_float(self._get_value(row, cfg.factor_value_column))
+            yield DolphinFactor(instrument_id, factor_name, factor_value, ts_event, ts_init)
+            return
+
+        excluded = {
+            cfg.timestamp_column,
+            cfg.instrument_column,
+            cfg.factor_name_column,
+            cfg.factor_value_column,
+            "ts",
+            "time",
+            "timestamp",
+            "createTime",
+            "created_at",
+            "instrument",
+            "instrument_id",
+            "instId",
+            "inst_id",
+            "symbol",
+            "underlying",
+            "uly",
+        }
+        produced = 0
+        for column in self._row_columns(row):
+            if column in excluded:
+                continue
+            value = self._get_value(row, column)
+            if not self._is_number(value):
+                continue
+            produced += 1
+            yield DolphinFactor(
+                instrument_id=instrument_id,
+                factor_name=str(column),
+                factor_value=float(value),
+                ts_event=ts_event,
+                ts_init=ts_init,
+            )
+
+        if produced == 0:
+            raise ValueError("no numeric factor value columns found")
+
+    def _enqueue_factor(self, factor: DolphinFactor) -> None:
+        try:
+            self._queue.put_nowait(factor)
+            self._received_count += 1
+            self._last_event_ts = factor.ts_event
+        except queue.Full:
+            # State-like factor streams should prefer freshness over completeness.
+            with suppress(queue.Empty):
+                self._queue.get_nowait()
+            self._queue.put_nowait(factor)
+            self._overflow_count += 1
+
+    def _enqueue_decode_error(self, message: str) -> None:
+        self._decode_error_count += 1
+        with suppress(queue.Full):
+            self._error_queue.put_nowait(message)
+
+    def _drain_error_queue(self) -> None:
+        drained = 0
+        while drained < 5:
+            try:
+                message = self._error_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.log.warning(message)
+            drained += 1
+
+    def _extract_ts_event(self, row: Any) -> int:
+        cfg = self._dolphin_config
+        for column in (cfg.timestamp_column, "ts", "time", "timestamp", "createTime", "created_at"):
+            if self._has_value(row, column):
+                return self._to_unix_nanos(self._get_value(row, column))
+        return int(time.time_ns())
+
+    def _extract_instrument_id(self, row: Any) -> InstrumentId:
+        cfg = self._dolphin_config
+        for column in (
+            cfg.instrument_column,
+            "instrument",
+            "instrument_id",
+            "instId",
+            "inst_id",
+            "symbol",
+            "underlying",
+            "uly",
+        ):
+            if self._has_value(row, column):
+                candidate = str(self._get_value(row, column))
+                if "." not in candidate:
+                    candidate = f"{candidate}.{cfg.venue_suffix}"
                 try:
-                    self._queue.put_nowait(factor)
-                    self._received_count += 1
-                except queue.Full:
-                    # Discard oldest to make room — bounded queue overflow protection
-                    try:
-                        self._queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    self._queue.put_nowait(factor)
-                    self._overflow_count += 1
+                    return InstrumentId.from_str(candidate)
+                except ValueError:
+                    continue
+        return InstrumentId.from_str(cfg.default_instrument_id)
 
-        except Exception:
-            # Silently absorb — never let exceptions propagate to the C++ thread.
-            # We cannot use self.log here (not thread-safe).
-            # In production, consider writing to a thread-safe file logger.
-            pass
+    @staticmethod
+    def _row_columns(row: Any) -> Iterable[str]:
+        return [str(column) for column in getattr(row, "index", [])]
+
+    @staticmethod
+    def _has_value(row: Any, column: str) -> bool:
+        if column not in getattr(row, "index", []):
+            return False
+        value = row[column]
+        return value is not None and not (isinstance(value, Real) and math.isnan(float(value)))
+
+    @staticmethod
+    def _get_value(row: Any, column: str, default: Any = None) -> Any:
+        if column not in getattr(row, "index", []):
+            return default
+        return row[column]
+
+    @staticmethod
+    def _is_number(value: Any) -> bool:
+        return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value))
+
+    @classmethod
+    def _as_float(cls, value: Any) -> float:
+        if not cls._is_number(value):
+            raise ValueError(f"value is not numeric: {value!r}")
+        return float(value)
+
+    @staticmethod
+    def _to_unix_nanos(value: Any) -> int:
+        if hasattr(value, "timestamp"):
+            return int(value.timestamp() * 1_000_000_000)
+        if isinstance(value, Real):
+            number = float(value)
+            if number > 1_000_000_000_000_000_000:
+                return int(number)
+            if number > 1_000_000_000_000_000:
+                return int(number * 1_000)
+            if number > 1_000_000_000_000:
+                return int(number * 1_000_000)
+            return int(number * 1_000_000_000)
+        if isinstance(value, str):
+            normalized = value.strip()
+            for fmt in (
+                "%Y.%m.%d %H:%M:%S.%f",
+                "%Y.%m.%d %H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S",
+            ):
+                try:
+                    return int(datetime.strptime(normalized, fmt).timestamp() * 1_000_000_000)
+                except ValueError:
+                    continue
+            with suppress(ValueError):
+                return int(datetime.fromisoformat(normalized).timestamp() * 1_000_000_000)
+        raise ValueError(f"unsupported timestamp value: {value!r}")
 
     # -- DRAIN (EVENT-LOOP THREAD) ------------------------------------------------
 
@@ -301,7 +497,6 @@ class DolphinDBBridgeActor(Actor):
             The timer event (None when called during on_stop cleanup).
 
         """
-        data_type = DataType(DolphinFactor)
         drained = 0
 
         while True:
@@ -310,13 +505,23 @@ class DolphinDBBridgeActor(Actor):
             except queue.Empty:
                 break
 
-            self.publish_data(data_type, factor)
+            self.publish_data(DOLPHIN_FACTOR_DATA_TYPE, factor)
             self._published_count += 1
+            self._last_publish_ts = self.clock.timestamp_ns()
             drained += 1
+
+        self._drain_error_queue()
 
         # Periodic overflow warning (throttled)
         if self._overflow_count > 0 and self._published_count % 10000 == 0:
             self.log.warning(
                 f"DolphinDB queue overflow count: {self._overflow_count} "
                 f"(consider increasing queue_maxsize or drain frequency)",
+            )
+
+        if drained > 0 and self._published_count % 1000 == 0:
+            self.log.info(
+                f"DolphinDB factors published={self._published_count} "
+                f"last_event_ts={self._last_event_ts} queue_size={self._queue.qsize()}",
+                LogColor.BLUE,
             )

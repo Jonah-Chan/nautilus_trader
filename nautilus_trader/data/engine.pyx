@@ -1512,7 +1512,7 @@ cdef class DataEngine(Component):
 
         mode_str = f"interval={command.snapshot_interval_ms}ms" if command.snapshot_interval_ms else "raw"
         bootstrap_str = f", initial_atm={initial_atm_price}" if initial_atm_price is not None else ""
-        self._log.info(
+        self._log.debug(
             f"Subscribed option chain for {series_key} "
             f"({len(active_ids)} active/{len(resolved)} total instruments, {mode_str}{bootstrap_str})",
         )
@@ -1906,7 +1906,7 @@ cdef class DataEngine(Component):
             return
 
         self._teardown_option_chain(series_key, client)
-        self._log.info(f"Unsubscribed option chain for {series_key}")
+        self._log.debug(f"Unsubscribed option chain for {series_key}")
 
 # -- REQUEST HANDLERS -----------------------------------------------------------------------------
 

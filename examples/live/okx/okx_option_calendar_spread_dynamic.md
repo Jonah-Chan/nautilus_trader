@@ -9,9 +9,9 @@
 默认运行模式是 data-only dry-run：
 
 - 默认只连接 OKX data client，不创建 OKX execution client。
-- 默认只打印 `CALENDAR_CANDIDATE` 日志，不真实下单。
-- 真实下单必须同时满足 `--enable-execution` 和 `--no-dry-run`。
-- 只传 `--enable-execution` 会在 `main()` 里直接抛错，避免误以为单独开启执行开关就会下单。
+- 默认只打印 `CALENDAR_CANDIDATE` 日志，不提交订单。
+- sandbox 下单必须同时满足 `--enable-execution` 和 `--no-dry-run`。
+- 只传 `--enable-execution` 会在 `main()` 里直接抛错，避免误以为单独开启执行开关就会提交订单。
 
 当前策略只识别“开多日历价差”候选：
 
@@ -75,13 +75,15 @@ OptionSeriesId(
 
 `OrderLegPlan` 是策略输出的“可执行参数”：
 
+- 业务角色，例如 `open_sell_near`、`open_buy_far`、`close_buy_near`、`close_sell_far`。
 - 合约 ID。
 - 买卖方向。
 - 数量。
 - 限价。
 - TIF。
+- `reduce_only`，当前只用于平仓腿，避免退出时反向打开新风险。
 
-dry-run 模式只把这些参数写入日志；真实执行模式才会用它们创建 Nautilus limit order。
+dry-run 模式只把这些参数写入日志；sandbox 执行模式才会用它们创建 Nautilus limit order。
 
 ### `CalendarOpportunity`
 
@@ -90,10 +92,12 @@ dry-run 模式只把这些参数写入日志；真实执行模式才会用它们
 - 包含 `CalendarPair`。
 - 保存近月、远月 quote。
 - 计算 `open_long_cost = far_ask - near_bid`。
-- 生成两条 `OrderLegPlan`：
+- 生成两条开仓 `OrderLegPlan`，字段名为 `open_legs`：
   - 近月腿：`SELL`，价格为 near bid。
   - 远月腿：`BUY`，价格为 far ask。
 - `reason` 固定为 `long_calendar_executable_bid_ask`。
+
+源码仍保留只读属性 `order_legs` 兼容早期测试和文档命名，但新逻辑使用 `open_legs`，因为平仓阶段还会按当前报价生成 `close_legs`。
 
 ## 3. 启动与运行生命周期
 
@@ -101,16 +105,16 @@ dry-run 模式只把这些参数写入日志；真实执行模式才会用它们
 
 `build_node(args)` 负责创建 live `TradingNode`：
 
-1. 解析运行环境：
+1. 解析 data client 运行环境：
    - `live` -> `OKXEnvironment.LIVE`
    - `demo` / `sandbox` -> `OKXEnvironment.DEMO`
 2. 解析标的列表，默认 `BTC,ETH`。
 3. 解析 OKX instrument families，默认 `BTC-USD,ETH-USD`。
 4. 始终创建 OKX data client。
-5. 只有在 `--enable-execution --no-dry-run` 同时出现时才创建 OKX exec client。
+5. 只有在 `--enable-execution --no-dry-run` 同时出现时才创建系统内置 sandbox exec client。
 6. 创建 `DynamicCalendarSpreadStrategy` 并加入 trader。
 7. 注册 OKX data client factory。
-8. 如需要执行，再注册 OKX exec client factory。
+8. 如需要执行，再注册 `SandboxLiveExecClientFactory`。
 9. `node.build()`。
 
 ### 3.2 Data client 配置
@@ -120,7 +124,7 @@ dry-run 模式只把这些参数写入日志；真实执行模式才会用它们
 - `instrument_provider=InstrumentProviderConfig(load_all=True)`：连接时全量加载合约定义，动态发现依赖这里的 cache。
 - `instrument_types=(OKXInstrumentType.OPTION,)`：只加载期权。
 - `instrument_families=families`：OKX options 必须明确 family，例如 `BTC-USD`、`ETH-USD`。
-- `http_timeout_secs=10`：REST 请求超时。
+- `http_timeout_secs=60`：REST 请求超时；全量 OPTION definitions 在代理下可能较慢。
 
 策略启动后，`on_start()` 会先扫描 cache，再订阅 instrument 更新并设置周期刷新。
 
@@ -134,20 +138,20 @@ dry-run 模式只把这些参数写入日志；真实执行模式才会用它们
 
 这意味着默认运行可以用于行情链路、动态发现、期权链订阅和候选信号验证，但不会触发交易所下单。
 
-### 3.4 真实执行环境
+### 3.4 系统 sandbox 执行环境
 
 当 `--enable-execution --no-dry-run` 同时出现时：
 
-- 创建 `OKXExecClientConfig`。
-- 执行环境与 data client 相同。
-- instrument provider 同样 `load_all=True`。
-- 只启用 OKX option families。
-- `margin_mode=OKXMarginMode.CROSS`。
-- `use_fills_channel=False`，依赖 orders 频道更新成交。
-- `LiveExecEngineConfig(reconciliation=True)`，启动时做持仓和挂单对账。
-- `open_check_interval_secs=5.0`，检查开放委托。
-- `position_check_interval_secs=60`，检查持仓。
-- `LiveRiskEngineConfig(bypass=False)`，真实执行必须经过风控。
+- 创建 `SandboxExecutionClientConfig`，不是 OKX demo/sandbox 账户。
+- 真实 OKX data client 继续提供 instruments、quotes 和 option-chain slices。
+- sandbox exec client 使用同一 venue `OKX` 和同一 instrument provider 口径，在本地 `SimulatedExchange(OKX)` 撮合订单。
+- 默认 `starting_balances="10 BTC,100 ETH,1000000 USD"`，其中 BTC/ETH 用于币本位期权结算口径。
+- `account_type="MARGIN"`、`oms_type="NETTING"`，用于组合腿的净持仓管理。
+- `use_reduce_only=True`，平仓腿的 reduce-only 指令会被 sandbox 执行端尊重。
+- `LiveExecEngineConfig(reconciliation=False)`，sandbox 无外部账户，不做交易所开盘对账。
+- 不启用连续 open-order / position check。sandbox 撮合器会直接发委托和成交事件；按外部 venue report 口径轮询本地 sandbox 反而会产生 `ORDER_NOT_FOUND` 或 position discrepancy 噪音。
+- `graceful_shutdown_on_exception=True`，未捕获异常时走优雅关闭。
+- `LiveRiskEngineConfig(bypass=False)`，sandbox 执行仍经过风控。
 
 ## 4. 动态发现逻辑
 
@@ -193,7 +197,7 @@ DISCOVERY | records=<合约记录数> series=<候选 series 数> pairs=<pair 数
 2. DataEngine option-chain manager：框架内部会对 option-chain 做一层保护。例如收到 `InstrumentStatus` 的 `CLOSE` / `NOT_AVAILABLE_FOR_TRADING`，或 quote/greeks 的 `ts_event >= expiration_ns` 时，会从 option-chain manager 中移除对应 instrument 并退订该 instrument 的 quote/greeks。这保护的是框架内部 option-chain 聚合器。
 3. 当前策略自己的候选池：`_records_by_id`、`_pairs`、`_subscribed_series`、`_latest_chains` 是策略自己维护的状态。DataEngine 清理 option-chain manager 不会自动同步删除这些策略字段；当前文件通过 `OptionTimeFilter` 和订阅同步补上策略侧的基础时间生命周期清理。
 
-因此，`self.cache.instruments()` 里仍看到一个过期合约是正常的；策略是否继续使用它，必须看策略自己的生命周期过滤和清理逻辑。当前文件会清理策略候选池与不再活跃的 option-chain series，但不会自动处理已经真实开仓的组合持仓退出。
+因此，`self.cache.instruments()` 里仍看到一个过期合约是正常的；策略是否继续使用它，必须看策略自己的生命周期过滤和清理逻辑。当前文件会清理策略候选池与不再活跃的 option-chain series；对已开仓 sandbox 组合，只实现基于 `max_open_seconds` 的示例平仓，不实现到期前风控退出或 roll。
 
 ### 4.3 期权合约过滤
 
@@ -283,7 +287,7 @@ underlying_code -> settlement_currency -> expiration_ns
 | `fixed` | 订阅固定行权价列表 |
 | `all_strikes` | 返回 `None`，让 DataEngine 使用该 series 全部行权价 |
 
-当前 CLI 暴露了 `--strike-range-policy fixed`，但没有暴露固定行权价列表参数；因此当前文件里的 fixed 模式没有完整的命令行输入面。默认 `atm_relative` 是实际可直接使用的路径。
+当前 CLI 同时暴露了 `--strike-range-policy fixed` 和 `--fixed-strikes`。默认 `atm_relative` 是不需要手动传 strike 列表的直接使用路径。
 
 ### 6.3 订阅调用
 
@@ -383,7 +387,7 @@ open_long_cost = far_ask - near_bid
 
 因此 `CALENDAR_CANDIDATE` 应理解为“行情层可组成两腿限价单参数”，不是最终交易信号质量证明。
 
-## 8. 候选输出与真实下单
+## 8. 候选输出与 sandbox 执行
 
 ### 8.1 dry-run 输出
 
@@ -402,7 +406,7 @@ CALENDAR_CANDIDATE
 
 dry-run 模式下，每次扫描最多输出 `max_opportunities_per_scan` 条，默认 10 条。
 
-### 8.2 真实执行触发
+### 8.2 sandbox 执行触发
 
 只有满足以下条件时才调用 `_submit_open_orders(opportunity)`：
 
@@ -411,24 +415,26 @@ execution_enabled=True
 dry_run=False
 ```
 
-真实执行路径每次扫描只提交一个机会，提交后立即 break，避免同一个扫描周期打开多组价差。
+执行路径每次扫描只提交一个机会，提交后立即 break，避免同一个扫描周期打开多组价差。这里的委托进入 Nautilus 系统内置 sandbox 撮合器，不进入 OKX 真实账户或 OKX demo 账户。
 
 ### 8.3 下单流程
 
 `_submit_open_orders()` 的流程：
 
-1. 如果状态已经是 `OPENING`、`OPEN` 或 `FAILED_NEEDS_FLATTEN`，直接返回。
-2. 对每条腿从 cache 取 instrument。
-3. 如果 instrument 不在 cache，记录 error 并放弃。
-4. 使用 `order_factory.limit()` 创建 limit order：
+1. 如果状态不是 `DISCOVERING`、`SCANNING` 或 `FLAT`，直接返回。
+2. 调用 `CalendarBasketLifecycle.begin_open(opportunity)`，状态切到 `OPENING`。
+3. 对开仓两腿单独订阅 `QuoteTick`，供后续平仓时兜底取价。
+4. 对每条腿从 cache 取 instrument。
+5. 如果 instrument 不在 cache，记录 error 并把状态切到 `FAILED_NEEDS_FLATTEN`。
+6. 使用 `order_factory.limit()` 创建 limit order：
    - `instrument_id`
    - `order_side`
    - `quantity=instrument.make_qty(leg.quantity)`
    - `price=instrument.make_price(leg.limit_price)`
    - `time_in_force=leg.time_in_force`
-5. 对两条腿分别 `submit_order(order)`。
-6. 保存 `_pending_opportunity`。
-7. 状态切到 `OPENING`。
+   - `reduce_only=leg.reduce_only`
+   - `tags=[basket_id, leg.role]`
+7. 对两条腿分别 `submit_order(order)`。
 
 当前实现先提交 near leg，再提交 far leg。它不是交易所原生组合单，也没有两腿原子成交保证。
 
@@ -439,24 +445,29 @@ dry_run=False
 ```mermaid
 stateDiagram-v2
     [*] --> DISCOVERING
+    DISCOVERING --> SCANNING: cache refresh and subscriptions ready
     DISCOVERING --> OPENING: submit near/far limit orders
+    SCANNING --> OPENING: submit near/far limit orders
+    FLAT --> OPENING: submit next basket
     OPENING --> OPEN: both legs filled qty >= order_qty
     OPENING --> FAILED_NEEDS_FLATTEN: any leg rejected/canceled/expired
-    FAILED_NEEDS_FLATTEN --> [*]: manual or external flatten required
-    OPEN --> [*]: no close logic in this file
+    OPEN --> CLOSING: max_open_seconds reached and close quotes available
+    CLOSING --> FLAT: both close legs filled qty >= order_qty
+    CLOSING --> FAILED_NEEDS_FLATTEN: any close leg rejected/canceled/expired
+    FAILED_NEEDS_FLATTEN --> [*]: inspect or external flatten required
 ```
 
 ### 9.1 成交确认
 
 `on_order_filled(event)` 会按 `instrument_id` 累加 `last_qty`。
 
-只有 `_pending_opportunity` 的两条腿都满足：
+只有当前生命周期目标里的两条腿都满足：
 
 ```text
 filled_qty_by_instrument[leg_id] >= order_qty
 ```
 
-状态才会切到 `OPEN`。
+开仓阶段状态会切到 `OPEN`，并记录 `opened_at_ns`；平仓阶段状态会切到 `FLAT`，并清空 active opportunity 和开仓时间。
 
 单腿成交不算组合成功，因为残腿风险仍然存在。
 
@@ -468,28 +479,34 @@ filled_qty_by_instrument[leg_id] >= order_qty
 - `on_order_canceled`
 - `on_order_expired`
 
-只要当前存在 `_pending_opportunity`，策略就把状态切到 `FAILED_NEEDS_FLATTEN`，并记录 error：
+只要当前状态处于 `OPENING` 或 `CLOSING`，策略就把状态切到 `FAILED_NEEDS_FLATTEN`，并记录 error：
 
 ```text
 Calendar spread leg did not complete: <instrument_id>.
-State moved to FAILED_NEEDS_FLATTEN; manual or configured flatten is required.
+State moved to FAILED_NEEDS_FLATTEN; inspect/flatten the sandbox account.
 ```
 
-进入该状态后，策略不会继续提交新价差订单。当前文件没有自动 flatten 逻辑，需要人工或外部模块处理残腿。
+进入该状态后，策略不会继续提交新价差订单。当前文件没有自动 flatten 残腿重试逻辑，需要人工检查 sandbox 账户或由外部模块处理残腿。
 
-### 9.3 已开仓合约的到期生命周期
+### 9.3 已开仓组合的示例平仓生命周期
 
-当前状态机只覆盖“提交两腿订单后，两腿是否成交”这一小段流程。两腿都成交后状态切到 `OPEN`，但源码没有继续维护这个 open spread 的完整生命周期。
+两腿都成交后状态切到 `OPEN`。当持仓时间达到 `max_open_seconds` 后，策略会尝试按当前盘口提交平多日历价差的 reduce-only 平仓腿：
 
-如果 near 或 far leg 之后进入到期黑窗、到期、不可交易或需要 roll，当前文件不会自动执行以下动作：
+```text
+near close leg = BUY near at near ask
+far close leg  = SELL far at far bid
+```
 
-- 不会在到期前主动平仓。
-- 不会按 DTE 或 expiry blackout 强制退出。
+平仓报价优先来自对应 near/far `OptionChainSlice`；如果 active strike 已经离开当前 option-chain strike range，则退回使用开仓时单独订阅的两条实际腿 `QuoteTick`。若仍没有有效 near ask 或 far bid，策略保持 `OPEN`，按 `status_interval_secs` 限频打印缺平仓报价告警，等待后续行情。
+
+当前文件仍没有实现以下生产级持仓生命周期：
+
+- 不会按 DTE 或 expiry blackout 提前强制退出。
 - 不会把 near leg roll 到下一到期日。
 - 不会自动检查已开仓组合是否仍满足策略约束。
 - 不会因为 cache 或 DataEngine option-chain manager 清理了某个 instrument，就自动平掉策略持仓。
 
-所以，开仓后的合约到期处理需要在策略层面单独维护。生产化版本至少需要记录 open spread 的两腿、开仓时间、目标退出时间、near/far DTE、风险限制、平仓/roll 条件，以及异常情况下的 flatten 路径。Nautilus cache 和 DataEngine option-chain manager 可以提供合约定义、状态和行情保护，但不会替这个策略决定何时退出持仓。
+所以，当前 `max_open_seconds` 逻辑只是 sandbox 示例退出路径，不等价于生产级到期、风险、止盈止损或 roll 管理。生产化版本至少还需要 near/far DTE 风控、风险限制、平仓/roll 条件、异常 flatten 路径和持久化状态恢复。
 
 ## 10. 关闭与自动停止
 
@@ -497,6 +514,7 @@ State moved to FAILED_NEEDS_FLATTEN; manual or configured flatten is required.
 
 1. 取消 `dynamic_calendar_refresh` 定时器。
 2. 对 `_subscribed_series` 中记录的 series 主动 `unsubscribe_option_chain()`。
+3. 对 active basket 的单腿 `QuoteTick` 订阅主动 `unsubscribe_quote_ticks()`。
 
 `--run-seconds N` 会通过 `schedule_node_stop()` 启动一个后台 shell，等待 N 秒后向当前进程发送 `SIGINT`。这样 smoke run 可以走 TradingNode 正常 shutdown，而不是强杀进程。
 
@@ -504,10 +522,13 @@ State moved to FAILED_NEEDS_FLATTEN; manual or configured flatten is required.
 
 | 参数 | 默认值 | 策略含义 |
 |---|---:|---|
-| `--environment` | `live` | OKX 环境；`demo` 和 `sandbox` 都映射到 OKX DEMO |
+| `--data-environment` | `live` | OKX data client 环境；默认使用真实行情 |
 | `--underlyings` | `BTC,ETH` | 动态发现时保留的标的 |
 | `--instrument-families` | `BTC-USD,ETH-USD` | OKX option families；必须与 provider 加载范围一致 |
 | `--expiry-pair-mode` | `all` | `all` 全组合，`adjacent` 仅相邻到期 |
+| `--min-dte-days` | `1` | 最短剩余到期天数 |
+| `--max-dte-days` | `720` | 最长剩余到期天数 |
+| `--expiry-blackout-minutes` | `60` | 到期前黑窗分钟数 |
 | `--series-subscription-policy` | `all_discovered_series` | 订阅全部发现 series 或只订阅排序后的前 N 个 |
 | `--max-series-subscriptions` | `0` | 0 表示不限制；只在 ranked 模式生效 |
 | `--strike-range-policy` | `atm_relative` | 行权价订阅范围策略 |
@@ -520,10 +541,19 @@ State moved to FAILED_NEEDS_FLATTEN; manual or configured flatten is required.
 | `--stale-quote-ms` | `5000` | 单个 chain slice 最大允许年龄 |
 | `--max-cross-series-skew-ms` | `1000` | near/far chain 最大时间差 |
 | `--max-opportunities-per-scan` | `10` | dry-run 每轮最多打印候选数 |
+| `--status-interval-secs` | `30` | 状态日志最小间隔 |
+| `--candidate-log-interval-secs` | `10` | 同一 basket 候选日志最小间隔 |
 | `--order-qty` | `1` | 每条腿委托数量 |
+| `--max-open-seconds` | `60` | sandbox 持仓最长秒数，超时后提交 reduce-only 平仓腿 |
+| `--sandbox-starting-balances` | `10 BTC,100 ETH,1000000 USD` | 系统 sandbox 账户初始余额，BTC/ETH 对应币本位结算 |
+| `--sandbox-default-leverage` | `1` | 系统 sandbox 默认杠杆 |
 | `--run-seconds` | `0` | 0 表示持续运行；大于 0 时自动 SIGINT 停止 |
 | `--trader-id` | `DYN-CALENDAR-001` | Nautilus trader ID |
 | `--log-level` | `INFO` | 日志级别 |
+| `--proxy-url` | 空 | OKX data client 代理 URL，例如 `http://127.0.0.1:7897` |
+| `--data-api-key-env` | `OKX_API_KEY` | data client API key 环境变量名 |
+| `--data-api-secret-env` | `OKX_API_SECRET` | data client API secret 环境变量名 |
+| `--data-api-passphrase-env` | `OKX_API_PASSPHRASE` | data client passphrase 环境变量名 |
 | `--enable-execution` | `False` | 执行总开关 |
 | `--dry-run` | `True` | dry-run 开关 |
 | `--no-dry-run` | 不启用 | 取消 dry-run；必须与 `--enable-execution` 同时使用才允许下单 |
@@ -557,6 +587,16 @@ flowchart TD
     T --> U{"both legs filled?"}
     U -- "yes" --> V["OPEN"]
     U -- "reject/cancel/expire" --> W["FAILED_NEEDS_FLATTEN"]
+    V --> X{"max_open_seconds reached?"}
+    X -- "no" --> K
+    X -- "yes" --> Y["build close legs from OptionChainSlice or direct QuoteTick"]
+    Y --> Z{"close quotes valid?"}
+    Z -- "no" --> V
+    Z -- "yes" --> AA["_submit close reduce-only orders"]
+    AA --> AB["CLOSING"]
+    AB --> AC{"both close legs filled?"}
+    AC -- "yes" --> AD["FLAT"]
+    AC -- "reject/cancel/expire" --> W
 ```
 
 ## 13. 当前实现边界
@@ -572,8 +612,10 @@ flowchart TD
 - 按 `OptionSeriesId` 订阅 option-chain。
 - 基于 `OptionChainSlice` 的同 strike bid/ask 候选评估。
 - dry-run 输出可执行两腿参数。
-- 可选真实执行路径。
-- 真实执行路径下的最小开仓状态机和残腿失败状态。
+- 可选 Nautilus sandbox 执行路径。
+- sandbox 执行路径下的开仓、持仓计时、reduce-only 平仓状态机。
+- active basket 单腿 `QuoteTick` 订阅，用作 option-chain 不含 active strike 时的平仓报价兜底。
+- 开仓或平仓腿异常终止后的 `FAILED_NEEDS_FLATTEN` 残腿失败状态。
 
 这份策略文件当前没有实现：
 
@@ -584,7 +626,7 @@ flowchart TD
 - 组合订单或原子化两腿执行。
 - 自动撤单后重试。
 - 自动 flatten 残腿。
-- 已开仓组合的止盈、止损、到期前平仓、roll 或持仓生命周期管理。
+- 已开仓组合的止盈、止损、DTE/到期黑窗强制退出、roll 或生产级持仓生命周期管理。
 - 持久化状态恢复。
 
-因此，当前文件更准确的定位是“动态日历价差发现 + dry-run 可执行参数生成 + 最小真实执行骨架”，不是完整生产级期权日历价差交易系统。
+因此，当前文件更准确的定位是“动态日历价差发现 + dry-run 可执行参数生成 + Nautilus sandbox 开平仓示例”，不是完整生产级期权日历价差交易系统。

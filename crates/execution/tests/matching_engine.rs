@@ -1317,6 +1317,53 @@ fn test_process_limit_order_matched_immediate_fill(
 }
 
 #[rstest]
+fn test_process_ioc_limit_order_full_fill_does_not_emit_cancel(
+    instrument_eth_usdt: InstrumentAny,
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+) {
+    let mut engine_l2 =
+        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, None);
+
+    let orderbook_delta_sell = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1500.00"),
+            Quantity::from("1.000"),
+            1,
+        ))
+        .build();
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let mut limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1501.00"))
+        .quantity(Quantity::from("1.000"))
+        .time_in_force(TimeInForce::Ioc)
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+
+    engine_l2
+        .process_order_book_delta(&orderbook_delta_sell)
+        .unwrap();
+    engine_l2.process_order(&mut limit_order, account_id);
+
+    let saved_messages = get_order_event_handler_messages(&order_event_handler);
+
+    assert_eq!(saved_messages.len(), 2);
+    assert!(matches!(saved_messages[0], OrderEventAny::Accepted(_)));
+    assert!(matches!(saved_messages[1], OrderEventAny::Filled(_)));
+    assert!(
+        !saved_messages
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Canceled(_))),
+        "fully filled IOC order must not emit a trailing cancel: {saved_messages:?}",
+    );
+}
+
+#[rstest]
 fn test_process_stop_market_order_triggered_rejected(
     instrument_eth_usdt: InstrumentAny,
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,

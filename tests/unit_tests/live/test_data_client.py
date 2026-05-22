@@ -22,6 +22,8 @@ from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.live.data_client import LiveDataClient
 from nautilus_trader.live.data_client import LiveMarketDataClient
+from nautilus_trader.live.data_client import _format_batched_subscription_success_msg
+from nautilus_trader.live.data_client import _parse_batchable_subscription_success_msg
 from nautilus_trader.live.data_engine import LiveDataEngine
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import Venue
@@ -37,6 +39,50 @@ BINANCE = Venue("BINANCE")
 XBTUSD_BITMEX = TestInstrumentProvider.xbtusd_bitmex()
 BTCUSDT_BINANCE = TestInstrumentProvider.btcusdt_binance()
 ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
+
+
+def test_parse_batchable_subscription_success_msg():
+    assert _parse_batchable_subscription_success_msg(
+        "Subscribed BTC-USD-260626-70000-C.OKX quotes"
+    ) == (
+        "Subscribed",
+        "quotes",
+        "BTC-USD-260626-70000-C.OKX",
+    )
+    assert _parse_batchable_subscription_success_msg(
+        "Unsubscribed ETH-USD-260626-3200-C.OKX option greeks",
+    ) == (
+        "Unsubscribed",
+        "option greeks",
+        "ETH-USD-260626-3200-C.OKX",
+    )
+    assert _parse_batchable_subscription_success_msg(
+        "Subscribed ETH-USD-260529-1800-C.OKX instrument status ",
+    ) == (
+        "Subscribed",
+        "instrument status",
+        "ETH-USD-260529-1800-C.OKX",
+    )
+    assert _parse_batchable_subscription_success_msg("Connected") is None
+
+
+def test_format_batched_subscription_success_msg():
+    assert _format_batched_subscription_success_msg(
+        "Subscribed", "quotes", ["BTC-USD-SWAP.OKX"]
+    ) == ("Subscribed BTC-USD-SWAP.OKX quotes")
+    assert _format_batched_subscription_success_msg(
+        "Unsubscribed",
+        "option greeks",
+        [
+            "BTC-USD-260626-70000-C.OKX",
+            "BTC-USD-260626-70000-P.OKX",
+            "ETH-USD-260626-3000-C.OKX",
+            "ETH-USD-260626-3000-P.OKX",
+        ],
+    ) == (
+        "Unsubscribed 4 instruments option greeks "
+        "(BTC-USD-260626-70000-C.OKX, BTC-USD-260626-70000-P.OKX, ETH-USD-260626-3000-C.OKX, ...)"
+    )
 
 
 class TestDataClientImpl(LiveDataClient):

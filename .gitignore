@@ -38,6 +38,7 @@ logs/
 *.iml
 .idea/
 .vscode/
+.zed/
 
 # Benchmarking and coverage
 .benchmarks*

@@ -14,33 +14,24 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Custom data types and configuration for DolphinDB streaming factor integration.
+Custom data types and configuration for lightweight DolphinDB factor ingestion.
 
-Defines:
-- ``DolphinFactor``: A custom ``Data`` subclass that carries a single factor value
-  associated with an instrument, published by the ``DolphinDBBridgeActor`` and
-  consumed by trading strategies via ``on_data``.
-- ``DolphinDBConfig``: Connection and subscription parameters for the DolphinDB
-  streaming client.
+This module intentionally keeps the integration lightweight: DolphinDB remains
+responsible for factor computation and storage, while NautilusTrader receives
+real-time factor events through an Actor-local MessageBus topic.
 
-Usage
------
-The ``DolphinFactor`` class inherits from ``Data`` (the Cython base class in
-NautilusTrader) so it can flow through the ``MessageBus`` via
-``publish_data`` / ``subscribe_data``.
-
-Attributes are plain Python types (no ``@customdataclass`` needed) because we
-do **not** require catalog persistence—these are ephemeral, real-time factors.
-
-If catalog persistence is required in the future, annotate with
-``@customdataclass`` and restrict attribute types to the supported set
-(``str``, ``float``, ``int``, ``bool``, ``InstrumentId``, etc.).
+``DolphinFactor`` is plain ephemeral ``Data``. It is not a PyO3 ``CustomData``
+persistence schema and should not be treated as a catalog/replay contract.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
+from nautilus_trader.common.data_topics import TopicCache
 from nautilus_trader.config import NautilusConfig
 from nautilus_trader.core.data import Data
+from nautilus_trader.model.data import DataType
 from nautilus_trader.model.identifiers import InstrumentId
 
 
@@ -48,29 +39,9 @@ class DolphinFactor(Data):
     """
     A real-time factor value produced by DolphinDB streaming computation.
 
-    This class is designed to carry a single factor snapshot from DolphinDB
-    into the NautilusTrader ``MessageBus``. The ``DolphinDBBridgeActor``
-    publishes instances of this class; any strategy that has called
-    ``subscribe_data(DataType(DolphinFactor))`` will receive them in
-    ``on_data``.
-
-    Parameters
-    ----------
-    instrument_id : InstrumentId
-        The instrument this factor pertains to. For calendar-spread factors,
-        this may be the near-leg instrument or a synthetic spread ID.
-    factor_name : str
-        Human-readable name of the factor (e.g. ``"vol_spread"``,
-        ``"term_structure_slope"``).
-    factor_value : float
-        The computed factor value.
-    ts_event : int
-        UNIX timestamp (nanoseconds) when the factor event occurred in
-        the DolphinDB engine.
-    ts_init : int
-        UNIX timestamp (nanoseconds) when this object was created in the
-        NautilusTrader process.
-
+    This class carries a single scalar factor event from DolphinDB into the
+    NautilusTrader ``MessageBus``. For wide DolphinDB surface-snapshot rows, the
+    bridge can publish one ``DolphinFactor`` per numeric factor column.
     """
 
     def __init__(
@@ -107,53 +78,62 @@ class DolphinFactor(Data):
         )
 
 
+DOLPHIN_FACTOR_DATA_TYPE = DataType(DolphinFactor)
+DOLPHIN_FACTOR_TOPIC = TopicCache().get_custom_data_topic(DOLPHIN_FACTOR_DATA_TYPE)
+
+
+def subscribe_dolphin_factors(actor: Any) -> None:
+    """
+    Subscribe an Actor/Strategy to locally published DolphinDB factors.
+
+    The current compiled ``Actor.subscribe_data`` implementation logs an error
+    when no DataClient or instrument target is supplied, even though the local
+    MessageBus subscription has already been installed. This example does not
+    need a DolphinDB DataClient or a Cython rebuild, so it subscribes directly
+    to the deterministic local custom-data topic used by ``Actor.publish_data``.
+    """
+    actor._msgbus.subscribe(
+        topic=DOLPHIN_FACTOR_TOPIC,
+        handler=actor.handle_data,
+    )
+
+
+def unsubscribe_dolphin_factors(actor: Any) -> None:
+    """Unsubscribe a Strategy/Actor from locally published DolphinDB factors."""
+    actor._msgbus.unsubscribe(
+        topic=DOLPHIN_FACTOR_TOPIC,
+        handler=actor.handle_data,
+    )
+
+
 class DolphinDBConfig(NautilusConfig, frozen=True):
     """
     Configuration for the DolphinDB streaming bridge.
 
-    Parameters
-    ----------
-    host : str
-        DolphinDB server hostname or IP.
-    port : int
-        DolphinDB server port (default 8848).
-    username : str
-        Login username.
-    password : str
-        Login password.
-    table_name : str
-        Name of the DolphinDB stream table to subscribe to.
-    action_name : str
-        Unique subscription action name (allows multiple subscribers to the
-        same stream table).
-    drain_interval_ms : int, default 5
-        Interval (milliseconds) at which the bridge actor drains the internal
-        thread-safe queue and publishes to the MessageBus. Lower values reduce
-        latency at the cost of slightly higher timer overhead.
-    queue_maxsize : int, default 10000
-        Maximum capacity of the internal thread-safe queue. When full, the
-        oldest items are discarded to prevent unbounded memory growth.
-    reconnect_delay_secs : float, default 5.0
-        Delay between reconnection attempts if the DolphinDB connection drops.
-    batch_size : int, default 1
-        DolphinDB ``subscribeTable`` batch size parameter. Set to 1 for
-        lowest latency (single-row push), or higher for throughput.
-    throttle : float, default 0.001
-        Minimum interval (seconds) between batch deliveries from DolphinDB.
-    streaming_port : int, default 0
-        Local port for receiving DolphinDB streaming data. 0 means auto-assign.
-
+    The defaults target the local project DolphinDB factor-platform stream. The
+    password should normally be supplied from environment/config at runtime; the
+    bridge never logs it.
     """
 
-    host: str = "127.0.0.1"
-    port: int = 8848
+    host: str = "192.168.10.100"
+    port: int = 8903
     username: str = "admin"
-    password: str = "123456"
-    table_name: str = "factor_output"
-    action_name: str = "nautilus_factor_sub"
+    password: str = ""
+    table_name: str = "okx_fp_surface_snapshot_stream"
+    action_name: str = "nautilus_surface_factor_sub"
     drain_interval_ms: int = 5
     queue_maxsize: int = 10000
     reconnect_delay_secs: float = 5.0
     batch_size: int = 1
     throttle: float = 0.001
     streaming_port: int = 0
+
+    # Column mapping for narrow factor tables. If ``factor_value_column`` is not
+    # present, the bridge treats numeric non-key columns as wide factor values.
+    timestamp_column: str = "calc_time"
+    instrument_column: str = "underlying"
+    factor_name_column: str = "factor_name"
+    factor_value_column: str = "factor_value"
+    default_factor_name: str = "surface_snapshot"
+    default_instrument_id: str = "OKX-DOLPHINDB.OKX"
+    venue_suffix: str = "OKX"

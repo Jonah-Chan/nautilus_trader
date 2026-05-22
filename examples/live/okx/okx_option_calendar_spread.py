@@ -55,12 +55,15 @@ Architecture
 
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 
 from dolphin_bridge_actor import DolphinDBBridgeActor
 from dolphin_bridge_actor import DolphinDBBridgeActorConfig
 from dolphin_factor_types import DolphinDBConfig
 from dolphin_factor_types import DolphinFactor
+from dolphin_factor_types import subscribe_dolphin_factors
+from dolphin_factor_types import unsubscribe_dolphin_factors
 
 from nautilus_trader.adapters.okx import OKX
 from nautilus_trader.adapters.okx import OKXDataClientConfig
@@ -79,7 +82,6 @@ from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
 from nautilus_trader.core.nautilus_pyo3 import OKXMarginMode
 from nautilus_trader.live.config import LiveRiskEngineConfig
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import OrderSide
@@ -208,8 +210,9 @@ class CalendarSpreadStrategy(Strategy):
         self.subscribe_mark_prices(self.config.near_leg_id)
         self.subscribe_mark_prices(self.config.far_leg_id)
 
-        # Subscribe to DolphinDB factor data
-        self.subscribe_data(DataType(DolphinFactor))
+        # Subscribe to locally published DolphinDB factor data. This is an
+        # Actor-bridge MessageBus subscription, not a DataClient command.
+        subscribe_dolphin_factors(self)
 
         self.log.info("All subscriptions active", LogColor.GREEN)
 
@@ -223,7 +226,9 @@ class CalendarSpreadStrategy(Strategy):
             self.close_all_positions(self.config.far_leg_id)
             self.log.info("Closed all positions", LogColor.YELLOW)
 
-        # Unsubscribe Greeks
+        # Unsubscribe local DolphinDB factors and Greeks
+        unsubscribe_dolphin_factors(self)
+
         client_id = ClientId(OKX)
         self.unsubscribe_option_greeks(self.config.near_leg_id, client_id=client_id)
         self.unsubscribe_option_greeks(self.config.far_leg_id, client_id=client_id)
@@ -469,6 +474,25 @@ FAR_EXPIRY = "270326"    # Far-month expiry: 2027-03-26
 STRIKE = "120000"
 OPTION_TYPE = "C"        # C for Call, P for Put
 
+
+def okx_environment_from_env() -> OKXEnvironment:
+    """Resolve OKX environment from ``OKX_ENVIRONMENT``.
+
+    The node still authenticates data/exec clients when ``dry_run`` is enabled,
+    so the configured environment must match the credentials in the shell.
+    """
+    value = os.environ.get("OKX_ENVIRONMENT", "demo").strip().lower()
+    if value in {"live", "prod", "production"}:
+        return OKXEnvironment.LIVE
+    if value in {"demo", "sandbox", "paper"}:
+        return OKXEnvironment.DEMO
+    raise ValueError(
+        "OKX_ENVIRONMENT must be one of: live, prod, production, demo, sandbox, paper",
+    )
+
+
+OKX_ENVIRONMENT = okx_environment_from_env()
+
 near_symbol = f"{TOKEN}-USD-{NEAR_EXPIRY}-{STRIKE}-{OPTION_TYPE}"
 far_symbol = f"{TOKEN}-USD-{FAR_EXPIRY}-{STRIKE}-{OPTION_TYPE}"
 
@@ -477,12 +501,14 @@ far_leg_id = InstrumentId.from_str(f"{far_symbol}.{OKX}")
 
 # ---- DolphinDB Configuration ----
 dolphin_config = DolphinDBConfig(
-    host="127.0.0.1",
-    port=8848,
+    host="192.168.10.100",
+    port=8903,
     username="admin",
-    password="123456",
-    table_name="factor_output",
-    action_name="calendar_spread_sub",
+    password=os.environ.get("DOLPHINDB_PASSWORD", ""),
+    table_name="okx_fp_surface_snapshot_stream",
+    action_name="calendar_spread_surface_snapshot_sub",
+    timestamp_column="calc_time",
+    instrument_column="underlying",
     drain_interval_ms=5,         # 5ms drain interval
     queue_maxsize=10000,
     batch_size=1,                # Single-row push for lowest latency
@@ -508,7 +534,7 @@ config_node = TradingNodeConfig(
     risk_engine=LiveRiskEngineConfig(bypass=True),
     data_clients={
         OKX: OKXDataClientConfig(
-            environment=OKXEnvironment.DEMO,   # ← Switch to LIVE for production
+            environment=OKX_ENVIRONMENT,
             instrument_provider=InstrumentProviderConfig(
                 load_all=False,
                 load_ids=frozenset([near_leg_id, far_leg_id]),
@@ -520,7 +546,7 @@ config_node = TradingNodeConfig(
     },
     exec_clients={
         OKX: OKXExecClientConfig(
-            environment=OKXEnvironment.DEMO,   # ← Switch to LIVE for production
+            environment=OKX_ENVIRONMENT,
             instrument_provider=InstrumentProviderConfig(
                 load_all=False,
                 load_ids=frozenset([near_leg_id, far_leg_id]),
@@ -532,7 +558,7 @@ config_node = TradingNodeConfig(
             http_timeout_secs=10,
         ),
     },
-    timeout_connection=30.0,
+    timeout_connection=90.0,
     timeout_reconciliation=10.0,
     timeout_portfolio=10.0,
     timeout_disconnection=10.0,

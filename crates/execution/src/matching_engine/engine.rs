@@ -4343,9 +4343,21 @@ impl OrderMatchingEngine {
             }
         }
 
-        if order.time_in_force() == TimeInForce::Ioc && order.is_open() {
+        if order.time_in_force() == TimeInForce::Ioc
+            && self.core.order_exists(order.client_order_id())
+        {
             // IOC order has filled all available size
-            self.cancel_order(order, None);
+            let order = self
+                .cache
+                .borrow()
+                .order(&order.client_order_id())
+                .map(|o| o.clone())
+                .unwrap_or_else(|| order.clone());
+            if order.is_inflight() || order.is_open() {
+                self.cancel_order(&order, None);
+            } else {
+                self.purge_stale_core_entry(order.client_order_id());
+            }
             return;
         }
 
@@ -4897,7 +4909,31 @@ impl OrderMatchingEngine {
 
         if order.status() != OrderStatus::Accepted {
             let venue_order_id = self.ids_generator.get_venue_order_id(order).unwrap();
-            self.generate_order_accepted(order, venue_order_id);
+            let ts_now = self.clock.borrow().timestamp_ns();
+            let account_id = order
+                .account_id()
+                .unwrap_or(self.account_ids.get(&order.trader_id()).unwrap().to_owned());
+            let event = OrderEventAny::Accepted(OrderAccepted::new(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                venue_order_id,
+                account_id,
+                UUID4::new(),
+                ts_now,
+                ts_now,
+                false,
+            ));
+
+            if let Err(e) = order.apply(event.clone()) {
+                log::error!(
+                    "Failed to apply accepted event for {}: {e}",
+                    order.client_order_id()
+                );
+                return;
+            }
+            self.dispatch_order_event(event);
 
             // Activate before emitting `OrderUpdated` so `match_info` below
             // carries the activation flag.
