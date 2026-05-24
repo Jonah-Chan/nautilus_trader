@@ -25,6 +25,10 @@ option series 分组,订阅 2 个月内到期的全部行权价,并在收到 Opt
 
 from __future__ import annotations
 
+import argparse
+import os
+import signal
+import threading
 from collections.abc import Iterable
 from datetime import UTC
 from datetime import datetime
@@ -54,15 +58,20 @@ from nautilus_trader.common.actor import Actor
 from nautilus_trader.config import ActorConfig
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LoggingConfig
+from nautilus_trader.config import StreamingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
 from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
+from nautilus_trader.model.instruments import CryptoOption
+from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.instruments import Instrument
 
 
@@ -491,13 +500,33 @@ class OKXOptionChainTester(Actor):
         )
 
 
-def build_node() -> TradingNode:
+def _parse_csv_tuple(raw: str) -> tuple[str, ...]:
+    return tuple(part.strip().upper() for part in raw.split(",") if part.strip())
+
+
+def _streaming_config_from_args(args: argparse.Namespace) -> StreamingConfig | None:
+    if not args.streaming_catalog_path:
+        return None
+
+    return StreamingConfig(
+        catalog_path=args.streaming_catalog_path,
+        fs_protocol="file",
+        flush_interval_ms=args.streaming_flush_interval_ms,
+        include_types=[QuoteTick, OptionGreeks, CryptoOption, CryptoPerpetual],
+        replace_existing=args.streaming_replace_existing,
+    )
+
+
+def build_node_config(args: argparse.Namespace) -> TradingNodeConfig:
+    families = _parse_csv_tuple(args.instrument_families)
+
     # OKX options 必须配置 instrument_families。只有 instrument_types=OPTION
     # 不足以让 provider 知道应该加载 BTC-USD 这类具体 family。
-    config_node = TradingNodeConfig(
-        trader_id=TraderId("OKX-CHAIN-001"),
+    return TradingNodeConfig(
+        trader_id=TraderId(args.trader_id),
+        instance_id=UUID4.from_str(args.instance_id) if args.instance_id else None,
         logging=LoggingConfig(
-            log_level="INFO",
+            log_level=args.log_level,
             # DataEngine 的 option-chain 订阅/退订是按 series 打 INFO。这个示例
             # 自己已经输出汇总日志,因此把 DataEngine stdout 降噪到 WARN。
             log_component_levels={"DataEngine": "WARN"},
@@ -508,26 +537,99 @@ def build_node() -> TradingNode:
                 environment=OKXEnvironment.LIVE,
                 instrument_provider=InstrumentProviderConfig(load_all=True),
                 instrument_types=(OKXInstrumentType.OPTION, OKXInstrumentType.SWAP),
-                instrument_families=("BTC-USD", "ETH-USD"),
-                http_timeout_secs=10,
+                instrument_families=families,
+                http_timeout_secs=args.http_timeout_secs,
             ),
         },
-        timeout_connection=30.0,
+        timeout_connection=args.timeout_connection_secs,
         timeout_reconciliation=10.0,
         timeout_portfolio=10.0,
         timeout_disconnection=10.0,
         timeout_post_stop=2.0,
+        streaming=_streaming_config_from_args(args),
     )
 
+
+def build_node(args: argparse.Namespace) -> TradingNode:
+    config_node = build_node_config(args)
+    underlyings = _parse_csv_tuple(args.underlyings)
+    swap_ids = tuple(coin_margined_swap_id(underlying) for underlying in underlyings)
+
     node = TradingNode(config=config_node)
-    node.trader.add_actor(OKXOptionChainTester(OKXOptionChainTesterConfig()))
+    node.trader.add_actor(
+        OKXOptionChainTester(
+            OKXOptionChainTesterConfig(
+                underlyings=underlyings,
+                underlying_swap_ids=swap_ids,
+                max_series_subscriptions=args.max_series_subscriptions,
+                min_dte_days=args.min_dte_days,
+                max_dte_days=args.max_dte_days,
+                expiry_blackout_minutes=args.expiry_blackout_minutes,
+                snapshot_interval_ms=args.snapshot_interval_ms,
+                max_strikes_to_log=args.max_strikes_to_log,
+            ),
+        ),
+    )
     node.add_data_client_factory(OKX, OKXLiveDataClientFactory)
     node.build()
     return node
 
 
+def schedule_node_stop(delay_seconds: int) -> None:
+    if delay_seconds <= 0:
+        return
+
+    timer = threading.Timer(delay_seconds, lambda: os.kill(os.getpid(), signal.SIGINT))
+    timer.daemon = True
+    timer.start()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--underlyings", default="BTC,ETH")
+    parser.add_argument("--instrument-families", default="BTC-USD,ETH-USD")
+    parser.add_argument("--min-dte-days", type=int, default=0)
+    parser.add_argument("--max-dte-days", type=int, default=62)
+    parser.add_argument("--expiry-blackout-minutes", type=int, default=60)
+    parser.add_argument("--max-series-subscriptions", type=int, default=0)
+    parser.add_argument("--snapshot-interval-ms", type=int, default=5_000)
+    parser.add_argument("--max-strikes-to-log", type=int, default=0)
+    parser.add_argument("--http-timeout-secs", type=int, default=10)
+    parser.add_argument("--timeout-connection-secs", type=float, default=30.0)
+    parser.add_argument("--run-seconds", type=int, default=0)
+    parser.add_argument(
+        "--instance-id",
+        default="",
+        help="Optional UUID4 instance id, useful for deterministic streaming catalog paths.",
+    )
+    parser.add_argument(
+        "--streaming-catalog-path",
+        default="",
+        help=(
+            "Enable Nautilus native StreamingConfig feather recording under "
+            "<path>/live/<instance-id>, including OptionGreeks."
+        ),
+    )
+    parser.add_argument(
+        "--streaming-flush-interval-ms",
+        type=int,
+        default=1_000,
+        help="Flush interval for StreamingConfig feather writer.",
+    )
+    parser.add_argument(
+        "--streaming-replace-existing",
+        action="store_true",
+        help="Replace existing stream files for the same instance id.",
+    )
+    parser.add_argument("--trader-id", default="OKX-CHAIN-001")
+    parser.add_argument("--log-level", default="INFO")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    node = build_node()
+    args = parse_args()
+    schedule_node_stop(args.run_seconds)
+    node = build_node(args)
     try:
         node.run()
     finally:

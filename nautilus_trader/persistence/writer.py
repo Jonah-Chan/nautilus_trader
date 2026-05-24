@@ -35,6 +35,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import CustomData
 from nautilus_trader.model.data import FundingRateUpdate
+from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import OrderBookDepth10
@@ -136,6 +137,7 @@ class StreamingFeatherWriter:
             "bar",
             "order_book_deltas",
             "order_book_depths",
+            "option_greeks",
             "quote_tick",
             "trade_tick",
             "funding_rate_update",
@@ -476,6 +478,7 @@ class StreamingFeatherWriter:
         | Bar
         | OrderBookDelta
         | OrderBookDepth10
+        | OptionGreeks
         | FundingRateUpdate
         | object,
     ) -> dict[bytes, bytes]:

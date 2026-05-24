@@ -81,9 +81,11 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import StrategyConfig
+from nautilus_trader.config import StreamingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
 from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.live.config import LiveRiskEngineConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import QuoteTick
@@ -94,6 +96,8 @@ from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model.instruments import CryptoOption
+from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price
 from nautilus_trader.trading.strategy import Strategy
@@ -1929,6 +1933,18 @@ def _parse_time_in_force(raw: str) -> TimeInForce:
         raise ValueError(f"Unsupported time_in_force: {raw}; expected one of {valid}") from exc
 
 
+def _streaming_config_from_args(args: argparse.Namespace) -> StreamingConfig | None:
+    if not args.streaming_catalog_path:
+        return None
+    return StreamingConfig(
+        catalog_path=args.streaming_catalog_path,
+        fs_protocol="file",
+        flush_interval_ms=args.streaming_flush_interval_ms,
+        include_types=[QuoteTick, CryptoOption, CryptoPerpetual],
+        replace_existing=args.streaming_replace_existing,
+    )
+
+
 def build_node_components(
     args: argparse.Namespace,
 ) -> tuple[TradingNodeConfig, OKXPutCallParityConfig]:
@@ -1978,6 +1994,7 @@ def build_node_components(
 
     config_node = TradingNodeConfig(
         trader_id=TraderId(args.trader_id),
+        instance_id=UUID4.from_str(args.instance_id) if args.instance_id else None,
         logging=LoggingConfig(
             log_level=args.log_level,
             log_component_levels={"DataEngine": "WARN"},
@@ -1992,6 +2009,7 @@ def build_node_components(
         timeout_portfolio=10.0,
         timeout_disconnection=10.0,
         timeout_post_stop=2.0,
+        streaming=_streaming_config_from_args(args),
     )
     strategy_config = OKXPutCallParityConfig(
         venue=Venue(OKX),
@@ -2123,6 +2141,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Stop opening new PCP baskets this many seconds after strategy start; existing baskets may still close.",
     )
     parser.add_argument("--run-seconds", type=int, default=0)
+    parser.add_argument(
+        "--instance-id",
+        default="",
+        help="Optional UUID4 instance id, useful for deterministic streaming catalog paths.",
+    )
+    parser.add_argument(
+        "--streaming-catalog-path",
+        default="",
+        help=(
+            "Enable Nautilus native StreamingConfig feather recording under "
+            "<path>/live/<instance-id>."
+        ),
+    )
+    parser.add_argument(
+        "--streaming-flush-interval-ms",
+        type=int,
+        default=1_000,
+        help="Flush interval for StreamingConfig feather writer.",
+    )
+    parser.add_argument(
+        "--streaming-replace-existing",
+        action="store_true",
+        help="Replace existing stream files for the same instance id.",
+    )
     parser.add_argument("--trader-id", default="OKX-PCP-001")
     parser.add_argument("--log-level", default="INFO")
     data_key_env, data_secret_env, data_passphrase_env = _credential_env_names("OKX")

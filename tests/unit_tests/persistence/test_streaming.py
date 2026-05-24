@@ -28,6 +28,7 @@ from nautilus_trader.config import BacktestDataConfig
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import BacktestRunConfig
 from nautilus_trader.config import ImportableStrategyConfig
+from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.data import Data
 from nautilus_trader.core.rust.model import BookType
 from nautilus_trader.model.book import OrderBook
@@ -35,6 +36,7 @@ from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarSpecification
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.data import InstrumentStatus
+from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggregationSource
@@ -54,6 +56,30 @@ from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.persistence import TestPersistenceStubs
 from tests.integration_tests.adapters.betfair.test_kit import BetfairTestStubs
+
+
+def _make_option_greeks(
+    instrument_id: InstrumentId,
+    ts_event: int,
+    ts_init: int,
+    convention=nautilus_pyo3.GreeksConvention.BLACK_SCHOLES,
+) -> OptionGreeks:
+    return OptionGreeks(
+        instrument_id=instrument_id,
+        delta=0.55,
+        gamma=0.02,
+        vega=0.15,
+        theta=-0.05,
+        rho=0.01,
+        mark_iv=0.25,
+        bid_iv=0.24,
+        ask_iv=0.26,
+        underlying_price=155.0,
+        open_interest=1000.0,
+        ts_event=ts_event,
+        ts_init=ts_init,
+        convention=convention,
+    )
 
 
 class TestPersistenceStreaming:
@@ -565,6 +591,65 @@ class TestPersistenceStreaming:
 
         # Verify the bar is a 5-MINUTE bar
         assert "5-MINUTE" in str(all_bars[0].bar_type)
+
+    def test_convert_live_stream_to_data_for_option_greeks(
+        self,
+        catalog_betfair: ParquetDataCatalog,
+    ) -> None:
+        # Arrange
+        self.catalog = catalog_betfair
+        clock = TestClock()
+        cache = Cache()
+        instrument = TestInstrumentProvider.btcusdt_binance()
+        cache.add_instrument(instrument)
+
+        instance_id = "test_live_option_greeks"
+        writer = StreamingFeatherWriter(
+            path=f"{self.catalog.path}/live/{instance_id}",
+            cache=cache,
+            clock=clock,
+            fs_protocol="file",
+            include_types=[OptionGreeks],
+        )
+        data = [
+            _make_option_greeks(instrument.id, ts_event=1, ts_init=2),
+            _make_option_greeks(
+                instrument.id,
+                ts_event=3,
+                ts_init=4,
+                convention=nautilus_pyo3.GreeksConvention.PRICE_ADJUSTED,
+            ),
+        ]
+
+        # Act
+        for item in data:
+            writer.write(item)
+        writer.close()
+
+        feather_files = list(
+            self.catalog.fs.glob(
+                f"{self.catalog.path}/live/{instance_id}/option_greeks/**/*.feather",
+            ),
+        )
+        self.catalog.convert_stream_to_data(
+            instance_id,
+            OptionGreeks,
+            subdirectory="live",
+        )
+        queried = self.catalog.query(
+            data_cls=OptionGreeks,
+            identifiers=[instrument.id.value],
+        )
+
+        # Assert
+        assert len(feather_files) == 1
+        assert len(queried) == 2
+        assert all(isinstance(item, OptionGreeks) for item in queried)
+        assert [item.convention for item in queried] == [
+            nautilus_pyo3.GreeksConvention.BLACK_SCHOLES,
+            nautilus_pyo3.GreeksConvention.PRICE_ADJUSTED,
+        ]
+        assert [item.ts_init for item in queried] == [2, 4]
 
     def test_convert_stream_to_data_internal_to_external(
         self,

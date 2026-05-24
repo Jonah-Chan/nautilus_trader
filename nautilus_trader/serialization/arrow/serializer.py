@@ -34,6 +34,7 @@ from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.data import IndexPriceUpdate
 from nautilus_trader.model.data import InstrumentClose
 from nautilus_trader.model.data import MarkPriceUpdate
+from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import OrderBookDepth10
@@ -43,6 +44,7 @@ from nautilus_trader.model.events import AccountState
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderInitialized
 from nautilus_trader.model.events import PositionEvent
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.wranglers_v2 import BarDataWranglerV2
 from nautilus_trader.persistence.wranglers_v2 import OrderBookDeltaDataWranglerV2
@@ -372,6 +374,60 @@ def dicts_to_record_batch(data: list[dict], schema: pa.Schema) -> pa.RecordBatch
         print(e)
 
 
+def _option_greeks_to_dict(data: OptionGreeks) -> dict[str, Any]:
+    return {
+        "instrument_id": data.instrument_id.value,
+        "delta": data.delta,
+        "gamma": data.gamma,
+        "vega": data.vega,
+        "theta": data.theta,
+        "rho": data.rho,
+        "mark_iv": data.mark_iv,
+        "bid_iv": data.bid_iv,
+        "ask_iv": data.ask_iv,
+        "underlying_price": data.underlying_price,
+        "open_interest": data.open_interest,
+        "convention": str(data.convention),
+        "ts_event": data.ts_event,
+        "ts_init": data.ts_init,
+    }
+
+
+def _serialize_option_greeks(data: list[OptionGreeks] | OptionGreeks) -> pa.RecordBatch:
+    if not isinstance(data, list):
+        data = [data]
+
+    return dicts_to_record_batch(
+        [_option_greeks_to_dict(item) for item in data],
+        schema=NAUTILUS_ARROW_SCHEMA[OptionGreeks],
+    )
+
+
+def _deserialize_option_greeks(table: pa.Table | pa.RecordBatch) -> list[OptionGreeks]:
+    if isinstance(table, pa.RecordBatch):
+        table = pa.Table.from_batches([table])
+
+    return [
+        OptionGreeks(
+            instrument_id=InstrumentId.from_str(row["instrument_id"]),
+            delta=row["delta"],
+            gamma=row["gamma"],
+            vega=row["vega"],
+            theta=row["theta"],
+            rho=row["rho"],
+            mark_iv=row["mark_iv"],
+            bid_iv=row["bid_iv"],
+            ask_iv=row["ask_iv"],
+            underlying_price=row["underlying_price"],
+            open_interest=row["open_interest"],
+            convention=nautilus_pyo3.GreeksConvention.from_str(row["convention"]),
+            ts_event=row["ts_event"],
+            ts_init=row["ts_init"],
+        )
+        for row in table.to_pylist()
+    ]
+
+
 RUST_SERIALIZERS = {
     OrderBookDelta,
     OrderBookDeltas,
@@ -422,6 +478,14 @@ for _data_cls in NAUTILUS_ARROW_SCHEMA:
         register_arrow(
             data_cls=_data_cls,
             schema=NAUTILUS_ARROW_SCHEMA[_data_cls],
+        )
+    elif _data_cls is OptionGreeks:
+        register_arrow(
+            data_cls=_data_cls,
+            schema=NAUTILUS_ARROW_SCHEMA[_data_cls],
+            encoder=_serialize_option_greeks,
+            decoder=_deserialize_option_greeks,
+            batch_encoder=_serialize_option_greeks,
         )
     else:
         register_arrow(

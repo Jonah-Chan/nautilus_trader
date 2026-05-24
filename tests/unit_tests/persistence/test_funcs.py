@@ -16,6 +16,7 @@
 import pandas as pd
 import pytest
 
+from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
@@ -41,6 +42,7 @@ def test_class_to_filename(s, expected):
         ("trade_tick", TradeTick),
         ("order_book_deltas", OrderBookDelta),
         ("quote_tick", QuoteTick),
+        ("option_greeks", OptionGreeks),
         ("nonexistent_filename", None),
     ],
 )

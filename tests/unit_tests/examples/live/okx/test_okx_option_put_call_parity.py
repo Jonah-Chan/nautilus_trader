@@ -53,6 +53,7 @@ from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.instruments import CryptoOption
+from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
@@ -1003,6 +1004,27 @@ def test_node_components_default_to_gtc_for_sandbox_lifecycle_control():
     _, strategy_config = build_node_components(args)
 
     assert strategy_config.time_in_force == TimeInForce.GTC
+
+
+def test_node_components_configure_market_data_streaming():
+    args = parse_args(
+        [
+            "--streaming-catalog-path",
+            "pcp-stream-catalog",
+            "--streaming-flush-interval-ms",
+            "250",
+            "--streaming-replace-existing",
+        ],
+    )
+
+    node_config, _ = build_node_components(args)
+
+    assert node_config.streaming is not None
+    assert node_config.streaming.catalog_path == "pcp-stream-catalog"
+    assert node_config.streaming.fs_protocol == "file"
+    assert node_config.streaming.flush_interval_ms == 250
+    assert node_config.streaming.replace_existing is True
+    assert node_config.streaming.include_types == [QuoteTick, CryptoOption, CryptoPerpetual]
 
 
 def test_node_components_system_sandbox_does_not_require_okx_demo_credentials(monkeypatch):

@@ -25,11 +25,13 @@ from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.common.messages import ComponentStateChanged
 from nautilus_trader.common.messages import ShutdownSystem
 from nautilus_trader.common.messages import TradingStateChanged
+from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.data import Data
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.custom import customdataclass
+from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.enums import AccountType
@@ -90,6 +92,47 @@ from tests.unit_tests.serialization.conftest import nautilus_objects
 AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
 CATALOG_PATH = TESTS_PACKAGE_ROOT / "unit_tests" / "persistence" / "catalog"
+
+
+def _make_option_greeks(
+    ts_event: int = 1,
+    ts_init: int = 2,
+    convention=nautilus_pyo3.GreeksConvention.BLACK_SCHOLES,
+    mark_iv: float | None = 0.25,
+) -> OptionGreeks:
+    return OptionGreeks(
+        instrument_id=ETHUSDT_BINANCE.id,
+        delta=0.55,
+        gamma=0.02,
+        vega=0.15,
+        theta=-0.05,
+        rho=0.01,
+        mark_iv=mark_iv,
+        bid_iv=0.24,
+        ask_iv=0.26,
+        underlying_price=155.0,
+        open_interest=1000.0,
+        ts_event=ts_event,
+        ts_init=ts_init,
+        convention=convention,
+    )
+
+
+def _assert_option_greeks_equal(actual: OptionGreeks, expected: OptionGreeks) -> None:
+    assert actual.instrument_id == expected.instrument_id
+    assert actual.delta == expected.delta
+    assert actual.gamma == expected.gamma
+    assert actual.vega == expected.vega
+    assert actual.theta == expected.theta
+    assert actual.rho == expected.rho
+    assert actual.mark_iv == expected.mark_iv
+    assert actual.bid_iv == expected.bid_iv
+    assert actual.ask_iv == expected.ask_iv
+    assert actual.underlying_price == expected.underlying_price
+    assert actual.open_interest == expected.open_interest
+    assert actual.convention == expected.convention
+    assert actual.ts_event == expected.ts_event
+    assert actual.ts_init == expected.ts_init
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on windows")
@@ -165,6 +208,39 @@ class TestArrowSerializer:
     )
     def test_serialize_and_deserialize_tick(self, data):
         self._test_serialization(obj=data)
+
+    def test_serialize_deserialize_and_query_option_greeks(self):
+        # Arrange
+        data = [
+            _make_option_greeks(
+                ts_event=1,
+                ts_init=2,
+                convention=nautilus_pyo3.GreeksConvention.BLACK_SCHOLES,
+                mark_iv=None,
+            ),
+            _make_option_greeks(
+                ts_event=3,
+                ts_init=4,
+                convention=nautilus_pyo3.GreeksConvention.PRICE_ADJUSTED,
+            ),
+        ]
+
+        # Act
+        serialized = ArrowSerializer.serialize_batch(data, data_cls=OptionGreeks)
+        deserialized = ArrowSerializer.deserialize(data_cls=OptionGreeks, batch=serialized)
+        self.catalog.write_data(data)
+        queried = self.catalog.query(
+            data_cls=OptionGreeks,
+            identifiers=[ETHUSDT_BINANCE.id.value],
+        )
+
+        # Assert
+        assert len(deserialized) == 2
+        assert len(queried) == 2
+        for actual, expected in zip(deserialized, data, strict=True):
+            _assert_option_greeks_equal(actual, expected)
+        for actual, expected in zip(queried, data, strict=True):
+            _assert_option_greeks_equal(actual, expected)
 
     def test_serialize_and_deserialize_order_book_delta(self):
         # Arrange

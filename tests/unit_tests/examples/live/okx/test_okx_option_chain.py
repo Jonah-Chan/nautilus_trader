@@ -19,12 +19,14 @@ import pandas as pd
 
 from examples.live.okx.okx_option_chain import OKXOptionChainTesterConfig
 from examples.live.okx.okx_option_chain import active_option_records
+from examples.live.okx.okx_option_chain import build_node_config
 from examples.live.okx.okx_option_chain import coin_margined_swap_id
 from examples.live.okx.okx_option_chain import format_strike_side
 from examples.live.okx.okx_option_chain import option_chain_slice_group_key
 from examples.live.okx.okx_option_chain import option_chain_slice_group_label
 from examples.live.okx.okx_option_chain import option_chain_slice_rows
 from examples.live.okx.okx_option_chain import option_series_count_label
+from examples.live.okx.okx_option_chain import parse_args
 from examples.live.okx.okx_option_chain import quote_tick_columns
 from examples.live.okx.okx_option_chain import select_series_keys
 from examples.live.okx.okx_option_chain import select_strikes_for_log
@@ -35,10 +37,13 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.model.currencies import BTC
 from nautilus_trader.model.currencies import ETH
 from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import OptionGreeks
+from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import OptionKind
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.instruments import CryptoOption
+from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
@@ -141,6 +146,33 @@ def test_default_config_covers_btc_eth_two_month_all_contract_intent():
     assert config.max_series_subscriptions == 0
     assert config.max_dte_days == 62
     assert config.max_strikes_to_log == 0
+
+
+def test_build_node_config_enables_option_greeks_streaming_recording():
+    args = parse_args(
+        [
+            "--instance-id",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "--streaming-catalog-path",
+            "option-chain-stream-catalog",
+            "--streaming-flush-interval-ms",
+            "250",
+            "--streaming-replace-existing",
+        ],
+    )
+
+    node_config = build_node_config(args)
+
+    assert node_config.instance_id.value == "123e4567-e89b-42d3-a456-426614174000"
+    assert node_config.streaming.catalog_path == "option-chain-stream-catalog"
+    assert node_config.streaming.flush_interval_ms == 250
+    assert node_config.streaming.replace_existing is True
+    assert node_config.streaming.include_types == [
+        QuoteTick,
+        OptionGreeks,
+        CryptoOption,
+        CryptoPerpetual,
+    ]
 
 
 def test_select_strikes_for_log_centers_window_around_atm_strike():
