@@ -14,13 +14,18 @@
 # -------------------------------------------------------------------------------------------------
 
 from decimal import Decimal
+from types import MethodType
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from examples.live.okx.okx_option_core import normalize_option_instrument
+from examples.live.okx.okx_option_put_call_parity import OKXPutCallParityConfig
+from examples.live.okx.okx_option_put_call_parity import OKXPutCallParityStrategy
 from examples.live.okx.okx_option_put_call_parity import PcpBasketLifecycle
 from examples.live.okx.okx_option_put_call_parity import PcpBasketState
+from examples.live.okx.okx_option_put_call_parity import PcpCycleTelemetry
 from examples.live.okx.okx_option_put_call_parity import PcpDirection
 from examples.live.okx.okx_option_put_call_parity import build_close_legs
 from examples.live.okx.okx_option_put_call_parity import build_node_components
@@ -28,6 +33,8 @@ from examples.live.okx.okx_option_put_call_parity import build_pcp_pairs
 from examples.live.okx.okx_option_put_call_parity import calculate_pcp_pricing
 from examples.live.okx.okx_option_put_call_parity import coin_margined_forward_value
 from examples.live.okx.okx_option_put_call_parity import coin_margined_swap_id
+from examples.live.okx.okx_option_put_call_parity import decimal_amount
+from examples.live.okx.okx_option_put_call_parity import elapsed_seconds
 from examples.live.okx.okx_option_put_call_parity import evaluate_pcp_opportunity
 from examples.live.okx.okx_option_put_call_parity import failed_flatten_leg_for_position
 from examples.live.okx.okx_option_put_call_parity import parse_args
@@ -144,6 +151,20 @@ class FakePosition:
         self.quantity = Quantity.from_str(quantity)
 
 
+class FakeLog:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def info(self, message: str, *args) -> None:
+        self.messages.append(("info", message))
+
+    def warning(self, message: str, *args) -> None:
+        self.messages.append(("warning", message))
+
+    def error(self, message: str, *args) -> None:
+        self.messages.append(("error", message))
+
+
 def _btc_pcp_pair():
     call = _record("BTC-USD-260626-70000-C", kind=OptionKind.CALL)
     put = _record("BTC-USD-260626-70000-P", kind=OptionKind.PUT)
@@ -203,12 +224,38 @@ def test_build_pcp_pairs_requires_same_underlying_settlement_expiry_and_strike()
     }
 
 
+def test_candidate_series_keys_only_include_series_with_complete_pcp_pairs():
+    paired_call = _record("BTC-USD-260626-70000-C", BTC, BTC, JUN_EXPIRY, "70000", OptionKind.CALL)
+    paired_put = _record("BTC-USD-260626-70000-P", BTC, BTC, JUN_EXPIRY, "70000", OptionKind.PUT)
+    orphan_call = _record("BTC-USD-260925-70000-C", BTC, BTC, SEP_EXPIRY, "70000", OptionKind.CALL)
+    strategy = OKXPutCallParityStrategy(
+        OKXPutCallParityConfig(
+            series_subscription_policy="all_discovered_series",
+            max_series_subscriptions=0,
+        ),
+    )
+    strategy._records_by_id = {
+        record.instrument_id: record
+        for record in (paired_call, paired_put, orphan_call)
+    }
+    strategy._pairs = build_pcp_pairs(strategy._records_by_id.values())
+
+    keys = strategy._candidate_series_keys()
+
+    assert keys == [paired_call.series_key]
+
+
 def test_coin_margined_forward_value_uses_one_minus_strike_over_swap_price():
     assert coin_margined_forward_value(Price.from_str("70000"), Price.from_str("80000")) == Decimal(
         "0.125",
     )
     with pytest.raises(ValueError, match="must be positive"):
         coin_margined_forward_value("70000", "0")
+
+
+def test_elapsed_seconds_clamps_clock_skew_to_zero():
+    assert elapsed_seconds(1_000_000_000, 3_500_000_000) == 2.5
+    assert elapsed_seconds(3_500_000_000, 1_000_000_000) == 0
 
 
 def test_buy_synthetic_sell_hedge_opportunity_uses_executable_bid_ask_legs():
@@ -218,6 +265,15 @@ def test_buy_synthetic_sell_hedge_opportunity_uses_executable_bid_ask_legs():
     assert opportunity.synthetic_ask_coin == Decimal("0.1100")
     assert opportunity.hedge_bid_coin == Decimal("0.125")
     assert opportunity.edge_coin == Decimal("0.0150")
+    assert opportunity.entry_executable_cost_coin == Decimal("-0.0150")
+    assert opportunity.entry_mid_edge_coin > Decimal("0.025")
+    assert opportunity.entry_bid_ask_spread_coin > Decimal("0.020")
+    assert opportunity.call_spread == Decimal("0.0100")
+    assert opportunity.put_spread == Decimal("0.0100")
+    assert opportunity.call_age_ms == Decimal(0)
+    assert opportunity.put_age_ms == Decimal(0)
+    assert opportunity.swap_age_ms == Decimal(0)
+    assert opportunity.chain_age_ms == Decimal(0)
 
     call_leg, put_leg, swap_leg = opportunity.open_legs
     assert (call_leg.role, call_leg.side, call_leg.limit_price, call_leg.quantity) == (
@@ -547,6 +603,318 @@ def test_lifecycle_fails_stale_pending_basket_without_terminal_event():
     assert lifecycle.active_opportunity is None
 
 
+def _bind_pending_order_helpers(strategy) -> None:
+    strategy._pending_order_ids_for_cycle = MethodType(
+        OKXPutCallParityStrategy._pending_order_ids_for_cycle,
+        strategy,
+    )
+    strategy._cancel_unfilled_orders_for_cycle = MethodType(
+        OKXPutCallParityStrategy._cancel_unfilled_orders_for_cycle,
+        strategy,
+    )
+    strategy._pending_order_instruments = MethodType(
+        OKXPutCallParityStrategy._pending_order_instruments,
+        strategy,
+    )
+    strategy._cancel_pending_orders = MethodType(
+        OKXPutCallParityStrategy._cancel_pending_orders,
+        strategy,
+    )
+    strategy._retire_report_blocking_orders_for_cycle = MethodType(
+        OKXPutCallParityStrategy._retire_report_blocking_orders_for_cycle,
+        strategy,
+    )
+    strategy._complete_failed_flatten_without_positions = MethodType(
+        OKXPutCallParityStrategy._complete_failed_flatten_without_positions,
+        strategy,
+    )
+    strategy._has_pending_orders_for_cycle = MethodType(
+        OKXPutCallParityStrategy._has_pending_orders_for_cycle,
+        strategy,
+    )
+    strategy._mark_cycle_failed = OKXPutCallParityStrategy._mark_cycle_failed
+
+
+def test_pending_timeout_cancels_unfilled_cycle_orders_only():
+    opportunity, _, _ = _opportunity_for_buy_synthetic()
+    lifecycle = PcpBasketLifecycle()
+    lifecycle.mark_scanning()
+    lifecycle.begin_open(opportunity, now_ns=1_000_000_000)
+    filled_leg = opportunity.open_legs[2]
+    lifecycle.record_fill(filled_leg.instrument_id, filled_leg.quantity, ts_event=2_000_000_000)
+    cycle = PcpCycleTelemetry(
+        cycle_id=1,
+        opportunity=opportunity,
+        opened_submit_ns=1_000_000_000,
+        entry_account_balances={},
+    )
+    canceled: list[InstrumentId] = []
+    strategy = SimpleNamespace(
+        _lifecycle=lifecycle,
+        config=SimpleNamespace(max_pending_seconds=5),
+        _active_cycle=cycle,
+        _pending_client_order_ids={"call-order", "put-order", "swap-order"},
+        _cycle_by_client_order_id={
+            "call-order": cycle,
+            "put-order": cycle,
+            "swap-order": cycle,
+        },
+        _order_instrument_by_client_order_id={
+            "call-order": opportunity.open_legs[0].instrument_id,
+            "put-order": opportunity.open_legs[1].instrument_id,
+            "swap-order": filled_leg.instrument_id,
+        },
+        cancel_all_orders=lambda instrument_id, client_id: canceled.append(instrument_id),
+        log=FakeLog(),
+    )
+    _bind_pending_order_helpers(strategy)
+
+    failed = OKXPutCallParityStrategy._maybe_fail_stale_pending_basket(
+        strategy,
+        now_ns=6_000_000_000,
+    )
+
+    assert failed is True
+    assert lifecycle.state == PcpBasketState.FAILED_NEEDS_FLATTEN
+    assert cycle.close_path == "failed_flatten"
+    assert cycle.failure_reason == "pending_timeout"
+    assert cycle.failed_at_ns == 6_000_000_000
+    assert set(canceled) == {
+        opportunity.open_legs[0].instrument_id,
+        opportunity.open_legs[1].instrument_id,
+    }
+
+
+def test_failed_flatten_waits_for_pending_order_terminals_before_flat_report():
+    opportunity, _, _ = _opportunity_for_buy_synthetic()
+    lifecycle = PcpBasketLifecycle()
+    lifecycle.begin_failed_flatten(opportunity)
+    cycle = PcpCycleTelemetry(
+        cycle_id=1,
+        opportunity=opportunity,
+        opened_submit_ns=1_000_000_000,
+        entry_account_balances={},
+    )
+    cycle.mark_failed("pending_timeout", failed_at_ns=6_000_000_000)
+    canceled: list[InstrumentId] = []
+    strategy = SimpleNamespace(
+        _lifecycle=lifecycle,
+        _active_cycle=cycle,
+        _pending_client_order_ids={"call-order"},
+        _cycle_by_client_order_id={"call-order": cycle},
+        _order_instrument_by_client_order_id={
+            "call-order": opportunity.open_legs[0].instrument_id,
+        },
+        config=SimpleNamespace(max_pending_seconds=5),
+        cancel_all_orders=lambda instrument_id, client_id: canceled.append(instrument_id),
+        _open_positions_for_opportunity=lambda opportunity: [],
+        _maybe_log_cycle_report=lambda cycle: setattr(cycle, "report_logged", True),
+        log=FakeLog(),
+    )
+    _bind_pending_order_helpers(strategy)
+
+    OKXPutCallParityStrategy._maybe_flatten_failed_basket(strategy, now_ns=8_000_000_000)
+
+    assert lifecycle.state == PcpBasketState.FAILED_NEEDS_FLATTEN
+    assert cycle.report_logged is False
+    assert canceled == [opportunity.open_legs[0].instrument_id]
+
+    OKXPutCallParityStrategy._maybe_flatten_failed_basket(strategy, now_ns=11_000_000_000)
+
+    assert lifecycle.state == PcpBasketState.FLAT
+    assert strategy._pending_client_order_ids == set()
+    assert cycle.report_logged is True
+
+
+def test_late_fill_during_failed_flatten_triggers_flatten_check_immediately():
+    opportunity, _, _ = _opportunity_for_buy_synthetic()
+    lifecycle = PcpBasketLifecycle()
+    lifecycle.begin_failed_flatten(opportunity)
+    cycle = PcpCycleTelemetry(
+        cycle_id=1,
+        opportunity=opportunity,
+        opened_submit_ns=1_000_000_000,
+        entry_account_balances={},
+    )
+    calls: list[int] = []
+    strategy = SimpleNamespace(
+        _lifecycle=lifecycle,
+        _cycle_by_client_order_id={"late-order": cycle},
+        _last_cycle_by_instrument={opportunity.open_legs[1].instrument_id: cycle},
+        _active_cycle=cycle,
+        clock=SimpleNamespace(timestamp_ns=lambda: 9_000_000_000),
+        log=FakeLog(),
+        _maybe_flatten_failed_basket=lambda now_ns: calls.append(now_ns),
+    )
+    strategy._cycle_by_order_id_attr = MethodType(
+        OKXPutCallParityStrategy._cycle_by_order_id_attr,
+        strategy,
+    )
+    strategy._cycle_for_instrument = MethodType(
+        OKXPutCallParityStrategy._cycle_for_instrument,
+        strategy,
+    )
+    strategy._cycle_for_position_opened_event = MethodType(
+        OKXPutCallParityStrategy._cycle_for_position_opened_event,
+        strategy,
+    )
+    strategy._mark_cycle_failed = OKXPutCallParityStrategy._mark_cycle_failed
+
+    OKXPutCallParityStrategy.on_position_opened(
+        strategy,
+        SimpleNamespace(
+            instrument_id=opportunity.open_legs[1].instrument_id,
+            opening_order_id="late-order",
+        ),
+    )
+
+    assert calls == [9_000_000_000]
+    assert cycle.failure_reason == "late_fill_during_failed_flatten"
+
+
+def test_terminal_event_after_pending_timeout_is_acknowledged_without_new_error():
+    opportunity, _, _ = _opportunity_for_buy_synthetic()
+    lifecycle = PcpBasketLifecycle()
+    lifecycle.begin_failed_flatten(opportunity)
+    cycle = PcpCycleTelemetry(
+        cycle_id=1,
+        opportunity=opportunity,
+        opened_submit_ns=1_000_000_000,
+        entry_account_balances={},
+    )
+    cycle.mark_failed("pending_timeout", failed_at_ns=6_000_000_000)
+    strategy = SimpleNamespace(
+        _lifecycle=lifecycle,
+        _active_cycle=cycle,
+        clock=SimpleNamespace(timestamp_ns=lambda: 9_000_000_000),
+        log=FakeLog(),
+    )
+    strategy._mark_cycle_failed = OKXPutCallParityStrategy._mark_cycle_failed
+
+    OKXPutCallParityStrategy._handle_terminal_leg_event(
+        strategy,
+        SimpleNamespace(instrument_id=opportunity.open_legs[1].instrument_id),
+    )
+
+    assert cycle.failure_reason == "pending_timeout"
+    assert not [message for level, message in strategy.log.messages if level == "error"]
+    assert any(
+        "terminal leg event acknowledged after failure" in message
+        for level, message in strategy.log.messages
+        if level == "warning"
+    )
+
+
+def test_cancel_pending_orders_only_uses_tracked_pending_order_instruments():
+    opportunity, _, _ = _opportunity_for_buy_synthetic()
+    canceled: list[InstrumentId] = []
+    strategy = SimpleNamespace(
+        _pending_client_order_ids={"call-order", "put-order", "unknown-order"},
+        _order_instrument_by_client_order_id={
+            "call-order": opportunity.open_legs[0].instrument_id,
+            "put-order": opportunity.open_legs[1].instrument_id,
+        },
+        cancel_all_orders=lambda instrument_id, client_id: canceled.append(instrument_id),
+        log=FakeLog(),
+    )
+    _bind_pending_order_helpers(strategy)
+
+    OKXPutCallParityStrategy._cancel_pending_orders(strategy, "node_stop")
+
+    assert canceled == [
+        opportunity.open_legs[0].instrument_id,
+        opportunity.open_legs[1].instrument_id,
+    ]
+    assert any(
+        "PCP canceled pending tracked orders" in message
+        for level, message in strategy.log.messages
+        if level == "warning"
+    )
+
+
+def test_position_close_cycle_resolution_prefers_opening_order_id_over_stale_closer():
+    opportunity, _, _ = _opportunity_for_buy_synthetic()
+    previous_cycle = PcpCycleTelemetry(
+        cycle_id=1,
+        opportunity=opportunity,
+        opened_submit_ns=1,
+        entry_account_balances={},
+    )
+    active_cycle = PcpCycleTelemetry(
+        cycle_id=2,
+        opportunity=opportunity,
+        opened_submit_ns=2,
+        entry_account_balances={},
+    )
+    strategy = OKXPutCallParityStrategy.__new__(OKXPutCallParityStrategy)
+    strategy._cycle_by_client_order_id = {
+        "previous-close-order": previous_cycle,
+        "active-open-order": active_cycle,
+    }
+    strategy._active_cycle = active_cycle
+    strategy._last_cycle_by_instrument = {
+        opportunity.open_legs[0].instrument_id: active_cycle,
+    }
+    event = SimpleNamespace(
+        instrument_id=opportunity.open_legs[0].instrument_id,
+        opening_order_id="active-open-order",
+        closing_order_id="previous-close-order",
+    )
+
+    assert strategy._cycle_for_position_event(event) is active_cycle
+
+
+def test_pending_order_gate_keeps_cycle_report_waiting_for_terminal_orders():
+    opportunity, _, _ = _opportunity_for_buy_synthetic()
+    cycle = PcpCycleTelemetry(
+        cycle_id=1,
+        opportunity=opportunity,
+        opened_submit_ns=1,
+        entry_account_balances={},
+    )
+    strategy = OKXPutCallParityStrategy.__new__(OKXPutCallParityStrategy)
+    strategy._cycle_by_client_order_id = {"pending-close-order": cycle}
+    strategy._pending_client_order_ids = {"pending-close-order"}
+
+    assert strategy._has_pending_orders_for_cycle(cycle)
+
+    strategy._pending_client_order_ids.clear()
+
+    assert not strategy._has_pending_orders_for_cycle(cycle)
+
+
+def test_cycle_close_path_distinguishes_normal_close_from_failed_flatten():
+    opportunity, _, _ = _opportunity_for_buy_synthetic()
+    cycle = PcpCycleTelemetry(
+        cycle_id=1,
+        opportunity=opportunity,
+        opened_submit_ns=1,
+        entry_account_balances={},
+    )
+    cycle.mark_normal_close(500)
+
+    assert cycle.close_path == "normal_close"
+    assert cycle.closed_at_ns == 500
+    assert cycle.failure_reason is None
+
+    failed_cycle = PcpCycleTelemetry(
+        cycle_id=2,
+        opportunity=opportunity,
+        opened_submit_ns=1,
+        entry_account_balances={},
+    )
+    failed_cycle.mark_failed("pending_timeout")
+    failed_cycle.mark_failed("failed_flatten_complete")
+
+    assert failed_cycle.close_path == "failed_flatten"
+    assert failed_cycle.failure_reason == "pending_timeout"
+
+
+def test_decimal_amount_accepts_nautilus_money_text_with_currency_suffix():
+    assert decimal_amount("1_000_000.25 USD") == Decimal("1000000.25")
+    assert decimal_amount("-0.00000258 BTC") == Decimal("-0.00000258")
+
+
 def test_node_components_default_to_live_data_and_no_execution_client():
     args = parse_args(["--run-seconds", "1"])
 
@@ -611,6 +979,30 @@ def test_node_components_accept_candidate_log_throttle_override():
     assert node_config.data_clients[OKX].http_timeout_secs == 30
     assert node_config.timeout_connection == 90
     assert strategy_config.candidate_log_interval_secs == 0
+
+
+def test_node_components_accept_entry_cutoff_override():
+    args = parse_args(["--run-seconds", "300", "--entry-cutoff-seconds", "180"])
+
+    _, strategy_config = build_node_components(args)
+
+    assert strategy_config.entry_cutoff_seconds == 180
+
+
+def test_node_components_accept_time_in_force_override():
+    args = parse_args(["--time-in-force", "IOC"])
+
+    _, strategy_config = build_node_components(args)
+
+    assert strategy_config.time_in_force == TimeInForce.IOC
+
+
+def test_node_components_default_to_gtc_for_sandbox_lifecycle_control():
+    args = parse_args([])
+
+    _, strategy_config = build_node_components(args)
+
+    assert strategy_config.time_in_force == TimeInForce.GTC
 
 
 def test_node_components_system_sandbox_does_not_require_okx_demo_credentials(monkeypatch):

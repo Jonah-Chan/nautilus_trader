@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
+from itertools import count
 from typing import Any
 
 from nautilus_trader.core import nautilus_pyo3
@@ -100,6 +101,12 @@ def is_option_instrument(instrument: Instrument) -> bool:
         and hasattr(instrument, "expiration_ns")
         and hasattr(instrument, "underlying")
     )
+
+
+def is_supported_okx_option_symbol(symbol: str) -> bool:
+    # OKX instrument definitions can include _UM option-like rows that currently
+    # do not exist on the public bbo-tbt quote channel used by Nautilus quotes.
+    return "_UM-" not in symbol
 
 
 @dataclass(frozen=True)
@@ -187,9 +194,17 @@ class OptionTimeFilter:
     min_dte_days: int
     max_dte_days: int
     expiry_blackout_minutes: int
+    min_activation_age_seconds: int = 0
 
     def allows(self, record: OptionInstrumentRecord, now_ns: int) -> bool:
         if not record.is_activated(now_ns):
+            return False
+        if (
+            record.activation_ns
+            and self.min_activation_age_seconds > 0
+            and now_ns
+            < record.activation_ns + self.min_activation_age_seconds * 1_000_000_000
+        ):
             return False
 
         min_ns = self.min_dte_days * NS_PER_DAY
@@ -206,6 +221,8 @@ def normalize_option_instrument(
     # 动态发现的入口:从 cache/instrument events 里拿到任意 Instrument,只有具备
     # option_kind、strike_price、expiration_ns、underlying 的期权合约才会进入候选池。
     if not is_option_instrument(instrument):
+        return None
+    if not is_supported_okx_option_symbol(str(instrument.id.symbol)):
         return None
 
     underlying_code = to_code_str(instrument.underlying).upper()
@@ -232,12 +249,29 @@ def candidate_series_keys(
     max_count: int,
 ) -> list[OptionSeriesKey]:
     # 按 underlying/settlement/expiry 稳定排序,方便 live dry-run 限制订阅数量时可复现。
+    # ranked_active_series 有 max_count 时按 underlying/settlement 轮询取样,避免 BTC
+    # 的近月序列把有限订阅名额全部占满,导致 ETH 完全没有 live evidence。
     keys = sorted(
         {record.series_key for record in records},
         key=lambda k: (k.underlying_code, k.settlement_currency, k.expiration_ns),
     )
     if policy == "ranked_active_series" and max_count > 0:
-        return keys[:max_count]
+        grouped: dict[tuple[str, str], list[OptionSeriesKey]] = {}
+        for key in keys:
+            grouped.setdefault((key.underlying_code, key.settlement_currency), []).append(key)
+        selected: list[OptionSeriesKey] = []
+        for index in count():
+            progressed = False
+            for group_key in sorted(grouped):
+                group = grouped[group_key]
+                if index >= len(group):
+                    continue
+                selected.append(group[index])
+                progressed = True
+                if len(selected) >= max_count:
+                    return selected
+            if not progressed:
+                return selected
     if policy in {"ranked_active_series", "all_discovered_series"}:
         return keys
     raise ValueError(f"Unsupported series subscription policy: {policy}")
@@ -275,6 +309,7 @@ __all__ = [
     "get_instrument_quote_currency",
     "get_instrument_settlement_currency",
     "is_option_instrument",
+    "is_supported_okx_option_symbol",
     "normalize_option_instrument",
     "normalize_option_kind",
     "to_code_str",

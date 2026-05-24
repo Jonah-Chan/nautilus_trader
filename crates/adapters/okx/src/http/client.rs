@@ -117,11 +117,11 @@ use crate::{
         },
         models::OKXInstrument,
         parse::{
-            extract_inst_family, okx_instrument_type, okx_instrument_type_from_symbol,
-            parse_account_state, parse_base_quote_from_symbol, parse_candlestick,
-            parse_fill_report, parse_funding_rate, parse_index_price_update, parse_instrument_any,
-            parse_instrument_id, parse_mark_price_update, parse_order_status_report,
-            parse_position_status_report, parse_price, parse_quantity,
+            extract_inst_family, is_unsupported_okx_option_quote_instrument, okx_instrument_type,
+            okx_instrument_type_from_symbol, parse_account_state, parse_base_quote_from_symbol,
+            parse_candlestick, parse_fill_report, parse_funding_rate, parse_index_price_update,
+            parse_instrument_any, parse_instrument_id, parse_mark_price_update,
+            parse_order_status_report, parse_position_status_report, parse_price, parse_quantity,
             parse_spot_margin_position_from_balance, parse_trade_tick,
         },
     },
@@ -1719,6 +1719,14 @@ impl OKXHttpClient {
         let mut inst_id_codes: Vec<(Ustr, u64)> = Vec::new();
 
         for inst in &resp {
+            if is_unsupported_okx_option_quote_instrument(inst) {
+                log::debug!(
+                    "Skipping unsupported OKX option quote instrument {}",
+                    inst.inst_id
+                );
+                continue;
+            }
+
             // Collect inst_id_code mappings for WebSocket order operations
             if let Some(code) = inst.inst_id_code {
                 inst_id_codes.push((inst.inst_id, code));
@@ -1837,6 +1845,9 @@ impl OKXHttpClient {
         // Skip pre-open instruments which have incomplete/empty field values
         if raw_inst.state == OKXInstrumentStatus::Preopen {
             anyhow::bail!("Instrument {symbol} is in pre-open state");
+        }
+        if is_unsupported_okx_option_quote_instrument(raw_inst) {
+            anyhow::bail!("Instrument {symbol} is not supported by OKX option quote subscriptions");
         }
 
         let fee_rate_opt = {

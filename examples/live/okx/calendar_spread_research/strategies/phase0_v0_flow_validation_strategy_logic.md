@@ -1,6 +1,6 @@
-# `okx_option_calendar_spread_dynamic.py` 策略逻辑文档
+# `phase0_v0_flow_validation.py` 策略逻辑文档
 
-本文档对应同目录下的 `okx_option_calendar_spread_dynamic.py`。它按当前源码实现描述策略逻辑，不把未来计划或交易所理论能力写成已实现能力。
+本文档对应同目录下的 `phase0_v0_flow_validation.py`。根目录的 `okx_option_calendar_spread_dynamic.py` 只是兼容入口。本文按当前源码实现描述策略逻辑，不把未来计划或交易所理论能力写成已实现能力。
 
 ## 1. 策略定位
 
@@ -28,7 +28,7 @@ open_long_cost = far_ask - near_bid
 
 ### `OptionInstrumentRecord`
 
-`OptionInstrumentRecord` 位于同目录的 `okx_option_core.py`，是从 Nautilus `Instrument` 归一化出的单个期权合约记录。它是 OKX 期权策略通用的“合约事实记录”，不再包含日历价差特有的配对逻辑：
+`OptionInstrumentRecord` 位于 `examples/live/okx/okx_option_core.py`，是从 Nautilus `Instrument` 归一化出的单个期权合约记录。它是 OKX 期权策略通用的“合约事实记录”，不再包含日历价差特有的配对逻辑：
 
 - `instrument_id`：真实可下单合约 ID。
 - `venue`：交易所，默认 OKX。
@@ -212,11 +212,14 @@ DISCOVERY | records=<合约记录数> series=<候选 series 数> pairs=<pair 数
 
 然后策略会检查 `underlying` 是否在配置的 `underlyings` 中。默认只保留 `BTC` 和 `ETH`。
 
+Phase 0 还会拒绝 OKX symbol 中包含 `_UM-` 的 option-like 合约。`phase0_btc_eth_patched2h_20260522T155902Z.log` 证明，Nautilus `subscribe_option_chain()` 会从全局 instrument cache 为某个 series 选择 active instruments，而不只使用策略自己的 `_records_by_id`。如果 `_UM` option-like rows 已进入 cache，OKX 会对其 `bbo-tbt` quote 订阅返回 `60018`。因此 OKX adapter 在写入 cache 前跳过这类 rows，策略侧 normalizer 也保留同样的防线处理增量 instrument event。
+
 ### 4.4 到期与激活过滤
 
 `OptionTimeFilter.allows(record, now_ns)` 负责过滤不可参与策略的合约：
 
 - 如果 `activation_ns > now_ns`，说明合约尚未激活，跳过。
+- 如果合约刚激活且距离 `activation_ns` 小于 `min_activation_age_seconds`，跳过。
 - 剩余到期时间必须大于 `expiry_blackout_minutes`。
 - DTE 必须在 `[min_dte_days, max_dte_days]` 区间内。
 
@@ -225,8 +228,9 @@ DISCOVERY | records=<合约记录数> series=<候选 series 数> pairs=<pair 数
 - `min_dte_days=1`
 - `max_dte_days=720`
 - `expiry_blackout_minutes=60`
+- `min_activation_age_seconds=300`
 
-这会过滤掉尚未激活、临近到期黑窗内、过短 DTE 或过远 DTE 的合约。
+这会过滤掉尚未激活、刚上市但 `bbo-tbt` 可能尚不可订阅、临近到期黑窗内、过短 DTE 或过远 DTE 的合约。这个 300 秒 guard 是 Phase 0 的实盘流程保护：OKX instrument definition 可能先于该 strike 的可订阅 quote channel 出现。
 
 ## 5. 日历价差 pair 生成逻辑
 
@@ -269,7 +273,7 @@ DISCOVERY | records=<合约记录数> series=<候选 series 数> pairs=<pair 数
 underlying_code -> settlement_currency -> expiration_ns
 ```
 
-如果 `series_subscription_policy="ranked_active_series"` 且 `max_series_subscriptions > 0`，则只取排序后的前 N 个 series。否则订阅全部发现到的 series。
+如果 `series_subscription_policy="ranked_active_series"` 且 `max_series_subscriptions > 0`，则先按 `underlying_code/settlement_currency` 分组，再在各组之间轮询选择近月 series，直到达到 N 个订阅名额。这样 BTC 的近月序列不会把有限名额全部占满，BTC+ETH 验证时 ETH 也会获得 live 订阅证据。否则订阅全部发现到的 series。
 
 默认：
 
@@ -305,6 +309,12 @@ self.subscribe_option_chain(
 默认 `snapshot_interval_ms=2000`，即 DataEngine 最低每 2 秒推一次 `OptionChainSlice`。如果配置为 0，则由底层 DataEngine 按更高频率推送。
 
 策略用 `_subscribed_series` 记录已订阅 series，周期 refresh 不会重复发起同一 series 的订阅。
+
+### 6.3 BTC/ETH 执行覆盖
+
+在 `--enable-execution --no-dry-run` 的 sandbox 执行路径中，策略每次成功提交一个 underlying 的 basket 后，下次扫描会优先从下一个 configured underlying 开始。这个轮询只用于 `v0_flow_validation` 的证据覆盖，避免 BTC 候选持续排在前面导致 BTC+ETH 全量配置仍然只产生 BTC 订单。它不是盈利排序逻辑；后续正期望筛选应在 Phase 2 的 signal 层实现。
+
+当前 accepted Phase 0 GTC 证据并不是 BTC 为主：`phase0_btc_eth_gtc_stopflat_2h_20260523T040010Z.log` 的 analyzer 汇总为 144 个完整 cycle，BTC=59、ETH=85。早期 BTC 偏多或 BTC-only 现象来自未轮询、固定停止或被拒收的诊断 run，不能代表当前 accepted harness 的资产覆盖。
 
 ## 7. 行情回调与机会扫描
 
@@ -371,7 +381,8 @@ far leg  = BUY  far instrument, qty=order_qty, limit=far_ask,  TIF=IOC
 open_long_cost = far_ask - near_bid
 ```
 
-默认 `order_qty=1`，`time_in_force=IOC`。
+默认 `order_qty=1`，`time_in_force=IOC`。CLI 支持 `--time-in-force IOC|GTC|FOK`，用于把
+Phase 0 的流程闭环验证和 sandbox IOC cancel 语义验证拆开观察；默认仍保留 IOC 行为。
 
 ### 7.5 当前没有实现的机会过滤
 
@@ -401,10 +412,19 @@ CALENDAR_CANDIDATE
 | near=<near instrument> SELL qty=<qty> limit=<near_bid> tif=<TIF>
 | far=<far instrument> BUY qty=<qty> limit=<far_ask> tif=<TIF>
 | open_long_cost=<far_ask - near_bid>
+| entry_mid_cost=<far_mid - near_mid>
+| entry_executable_cost=<far_ask - near_bid>
+| near_spread=<near_ask - near_bid>
+| far_spread=<far_ask - far_bid>
+| near_quote_age_ms=<age>
+| far_quote_age_ms=<age>
+| simulated_fill_price_source=sandbox_matching_l1_limit_bid_ask
 | dry_run=<True/False>
 ```
 
 dry-run 模式下，每次扫描最多输出 `max_opportunities_per_scan` 条，默认 10 条。
+
+`simulated_fill_price_source=sandbox_matching_l1_limit_bid_ask` 的含义很窄：策略把 L1 bid/ask 转成限价单，Nautilus 本地 sandbox matching engine 按这些订单和本地撮合状态产生 fill。它不是 OKX 真实账户成交，不是 OKX demo 成交，也不是 Phase 1 里的 L2 VWAP 估算。Phase 1 才负责把 L1 限价、L2 VWAP、可成交数量和 sandbox fill 偏差放进 execution audit。
 
 ### 8.2 sandbox 执行触发
 
@@ -434,9 +454,22 @@ dry_run=False
    - `time_in_force=leg.time_in_force`
    - `reduce_only=leg.reduce_only`
    - `tags=[basket_id, leg.role]`
+
+OPEN 状态下准备平仓时，策略还会对缺失的 active-leg quote 订阅做 10 秒节流的 reassert。原因是 `OptionChainSlice` 的 ATM rebalance 可能会退订旧 strike；active basket 的两条腿仍然需要独立 quote 才能可靠平仓。
 7. 对两条腿分别 `submit_order(order)`。
 
 当前实现先提交 near leg，再提交 far leg。它不是交易所原生组合单，也没有两腿原子成交保证。
+
+注意：Nautilus sandbox matching engine 的 IOC 行为不能直接等同 OKX 真实 IOC。2h
+验证中已经观察到 IOC remainder cancel 在订单仍为 `INITIALIZED` 时触发 matching-engine
+error，随后订单仍可能在 sandbox 内延迟成交为 maker。该现象只能作为异常路径证据，
+不能作为真实交易所 IOC 成交质量证据。
+
+当前 GTC stop-after-FLAT smoke 已证明，同一 BTC+ETH 流程在移除 sandbox IOC cancel
+语义后可以完整开平并清洁退出。因此 `--time-in-force GTC` 只用于 Phase 0 流程闭环
+隔离验证；不能据此推导生产执行应使用 GTC。
+
+accepted Phase 0 GTC run 的 144 个 cycle 全部是负 realized PnL，这与代码意图一致：当前文件没有 edge 过滤，开仓固定按 far ask - near bid 支付可执行成本，平仓固定按 far bid - near ask 回收价值，并支付 sandbox taker fees。该 run 中每个 cycle 都满足 `entry_executable_cost > exit_executable_value`，因此“全亏”是点差、持仓期间报价变化和费用共同作用下的流程验证结果，不是 Phase 2 signal 失败结论。
 
 ## 9. 执行状态机与残腿风险
 
@@ -518,6 +551,12 @@ far close leg  = SELL far at far bid
 
 `--run-seconds N` 会通过 `schedule_node_stop()` 启动一个后台 shell，等待 N 秒后向当前进程发送 `SIGINT`。这样 smoke run 可以走 TradingNode 正常 shutdown，而不是强杀进程。
 
+`--stop-after-flat-seconds N` 是验证运行专用的 minimum-runtime stop gate。策略启动后至少运行 N 秒，并且至少完成一个 basket；当状态下一次回到 `FLAT` 时，策略设置 stop-requested 标记、阻止后续新开仓，再通过正常 `SIGINT` 停机。
+
+`--stop-after-completed-baskets N` 是验证运行专用的 sample-size stop gate。策略完成 N 个完整开仓-平仓 basket 后，在下一次 `FLAT` 立即触发同样的正常停机流程；它用于已有足够 BTC/ETH 完整 cycle 证据时，避免为了等待固定墙钟 gate 而被最后一个迟迟不平的持仓拉长测试时间。
+
+`--run-seconds` 可以同时保留为硬上限，但不能作为验收口径，因为固定墙钟时间可能打断 OPEN basket。
+
 ## 11. CLI 参数与默认值
 
 | 参数 | 默认值 | 策略含义 |
@@ -543,6 +582,8 @@ far close leg  = SELL far at far bid
 | `--max-opportunities-per-scan` | `10` | dry-run 每轮最多打印候选数 |
 | `--status-interval-secs` | `30` | 状态日志最小间隔 |
 | `--candidate-log-interval-secs` | `10` | 同一 basket 候选日志最小间隔 |
+| `--stop-after-flat-seconds` | `0` | 验证运行专用；达到最小时长后，在下一次已完成 basket 回到 FLAT 时正常停机并阻止新开仓 |
+| `--stop-after-completed-baskets` | `0` | 验证运行专用；完成 N 个完整开平 cycle 后，在下一次 FLAT 正常停机并阻止新开仓 |
 | `--order-qty` | `1` | 每条腿委托数量 |
 | `--max-open-seconds` | `60` | sandbox 持仓最长秒数，超时后提交 reduce-only 平仓腿 |
 | `--sandbox-starting-balances` | `10 BTC,100 ETH,1000000 USD` | 系统 sandbox 账户初始余额，BTC/ETH 对应币本位结算 |

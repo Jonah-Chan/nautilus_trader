@@ -1396,6 +1396,9 @@ pub fn parse_instrument_any(
             ts_init,
         )
         .map(Some),
+        OKXInstrumentType::Option if is_unsupported_okx_option_quote_instrument(instrument) => {
+            Ok(None)
+        }
         OKXInstrumentType::Option => parse_option_instrument(
             instrument,
             margin_init,
@@ -1416,6 +1419,14 @@ pub fn parse_instrument_any(
         .map(Some),
         OKXInstrumentType::Any => Ok(None),
     }
+}
+
+/// Returns `true` for OKX option instrument definitions that cannot be used by
+/// the public quote channels backing Nautilus option-chain subscriptions.
+#[must_use]
+pub fn is_unsupported_okx_option_quote_instrument(instrument: &OKXInstrument) -> bool {
+    instrument.inst_type == OKXInstrumentType::Option
+        && instrument.inst_id.as_str().contains("_UM-")
 }
 
 /// Common parsed instrument data extracted from OKX definitions.
@@ -3203,6 +3214,52 @@ mod tests {
         assert_eq!(instrument.min_notional(), None);
         assert_eq!(instrument.max_price(), None);
         assert_eq!(instrument.min_price(), None);
+    }
+
+    #[rstest]
+    fn test_parse_instrument_any_skips_unsupported_um_option_quote_instrument() {
+        let instrument = OKXInstrument {
+            inst_type: OKXInstrumentType::Option,
+            inst_id: Ustr::from("BTC-USD_UM-260525-76600-C"),
+            uly: Ustr::from("BTC-USD"),
+            inst_family: Ustr::from("BTC-USD"),
+            series_id: None,
+            inst_category: None,
+            base_ccy: Ustr::from(""),
+            quote_ccy: Ustr::from(""),
+            settle_ccy: Ustr::from("BTC"),
+            ct_val: "0.01".to_string(),
+            ct_mult: "1".to_string(),
+            ct_val_ccy: "BTC".to_string(),
+            opt_type: crate::common::enums::OKXOptionType::Call,
+            stk: "76600".to_string(),
+            list_time: Some(1779472560000),
+            exp_time: Some(1779667200000),
+            lever: String::new(),
+            tick_sz: "0.0005".to_string(),
+            lot_sz: "1".to_string(),
+            min_sz: "1".to_string(),
+            ct_type: OKXContractType::Inverse,
+            state: crate::common::enums::OKXInstrumentStatus::Live,
+            rule_type: String::new(),
+            max_lmt_sz: String::new(),
+            max_mkt_sz: String::new(),
+            max_lmt_amt: String::new(),
+            max_mkt_amt: String::new(),
+            max_twap_sz: String::new(),
+            max_iceberg_sz: String::new(),
+            max_trigger_sz: String::new(),
+            max_stop_sz: String::new(),
+            inst_id_code: Some(123),
+        };
+
+        assert!(is_unsupported_okx_option_quote_instrument(&instrument));
+
+        let parsed =
+            parse_instrument_any(&instrument, None, None, None, None, UnixNanos::default())
+                .unwrap();
+
+        assert!(parsed.is_none());
     }
 
     #[rstest]

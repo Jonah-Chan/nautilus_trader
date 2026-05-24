@@ -45,6 +45,7 @@ from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal
+from decimal import InvalidOperation
 from enum import Enum
 from typing import Any
 
@@ -178,11 +179,57 @@ class PcpPricing:
     hedge_ask_coin: Decimal
     buy_synthetic_edge_coin: Decimal
     sell_synthetic_edge_coin: Decimal
+    call_ts_event: int
+    put_ts_event: int
+    swap_ts_event: int
+    chain_ts_event: int
 
     def edge_for(self, direction: PcpDirection) -> Decimal:
         if direction == PcpDirection.BUY_SYNTHETIC_SELL_HEDGE:
             return self.buy_synthetic_edge_coin
         return self.sell_synthetic_edge_coin
+
+    @property
+    def call_mid(self) -> Decimal:
+        return (self.call_bid + self.call_ask) / Decimal(2)
+
+    @property
+    def put_mid(self) -> Decimal:
+        return (self.put_bid + self.put_ask) / Decimal(2)
+
+    @property
+    def hedge_mid_coin(self) -> Decimal:
+        return (self.hedge_bid_coin + self.hedge_ask_coin) / Decimal(2)
+
+    @property
+    def synthetic_mid_coin(self) -> Decimal:
+        return self.call_mid - self.put_mid
+
+    @property
+    def call_spread(self) -> Decimal:
+        return self.call_ask - self.call_bid
+
+    @property
+    def put_spread(self) -> Decimal:
+        return self.put_ask - self.put_bid
+
+    @property
+    def swap_spread(self) -> Decimal:
+        return self.swap_ask - self.swap_bid
+
+    @property
+    def executable_spread_coin(self) -> Decimal:
+        return (self.synthetic_ask_coin - self.synthetic_bid_coin) + (
+            self.hedge_ask_coin - self.hedge_bid_coin
+        )
+
+    def mid_edge_for(self, direction: PcpDirection) -> Decimal:
+        if direction == PcpDirection.BUY_SYNTHETIC_SELL_HEDGE:
+            return self.hedge_mid_coin - self.synthetic_mid_coin
+        return self.synthetic_mid_coin - self.hedge_mid_coin
+
+    def executable_cost_for(self, direction: PcpDirection) -> Decimal:
+        return -self.edge_for(direction)
 
 
 @dataclass(frozen=True)
@@ -194,8 +241,56 @@ class PcpOpportunity:
     hedge_bid_coin: Decimal
     hedge_ask_coin: Decimal
     edge_coin: Decimal
+    entry_mid_edge_coin: Decimal
+    entry_executable_cost_coin: Decimal
+    entry_bid_ask_spread_coin: Decimal
+    call_spread: Decimal
+    put_spread: Decimal
+    swap_spread: Decimal
+    call_age_ms: Decimal
+    put_age_ms: Decimal
+    swap_age_ms: Decimal
+    chain_age_ms: Decimal
     open_legs: tuple[OrderLegPlan, OrderLegPlan, OrderLegPlan]
     basket_id: str
+
+
+@dataclass
+class PcpCycleTelemetry:
+    cycle_id: int
+    opportunity: PcpOpportunity
+    opened_submit_ns: int
+    entry_account_balances: dict[str, Decimal]
+    exit_submit_ns: int | None = None
+    exit_reason: str | None = None
+    exit_mid_edge_coin: Decimal | None = None
+    exit_executable_value_coin: Decimal | None = None
+    exit_bid_ask_spread_coin: Decimal | None = None
+    closed_at_ns: int | None = None
+    close_path: str | None = None
+    failure_reason: str | None = None
+    failed_at_ns: int | None = None
+    commissions_by_currency: dict[str, Decimal] | None = None
+    realized_pnl_by_currency: dict[str, Decimal] | None = None
+    closed_instruments: set[InstrumentId] | None = None
+    report_logged: bool = False
+
+    def __post_init__(self) -> None:
+        self.commissions_by_currency = {}
+        self.realized_pnl_by_currency = {}
+        self.closed_instruments = set()
+
+    def mark_normal_close(self, closed_at_ns: int) -> None:
+        if self.closed_at_ns is not None:
+            return
+        self.closed_at_ns = closed_at_ns
+        self.close_path = self.close_path or "normal_close"
+
+    def mark_failed(self, reason: str, failed_at_ns: int | None = None) -> None:
+        self.close_path = "failed_flatten"
+        self.failure_reason = self.failure_reason or reason
+        if failed_at_ns is not None and self.failed_at_ns is None:
+            self.failed_at_ns = failed_at_ns
 
 
 def coin_margined_swap_id(underlying: str, venue: str = OKX) -> InstrumentId:
@@ -276,6 +371,29 @@ def _within_skew(left_ts: int, right_ts: int, max_skew_ms: int) -> bool:
     return abs(left_ts - right_ts) <= max_skew_ms * 1_000_000
 
 
+def quote_age_ms(now_ns: int, ts_event: int) -> Decimal:
+    if ts_event <= 0:
+        return Decimal(-1)
+    return Decimal(now_ns - ts_event) / Decimal(1_000_000)
+
+
+def elapsed_seconds(start_ns: int, end_ns: int) -> float:
+    return max(0, end_ns - start_ns) / 1_000_000_000
+
+
+def decimal_map_to_str(values: dict[str, Decimal]) -> dict[str, str]:
+    return {key: str(value) for key, value in sorted(values.items())}
+
+
+def decimal_amount(value: Any) -> Decimal:
+    try:
+        return to_decimal(value)
+    except InvalidOperation:
+        text = str(value).replace("_", "").strip()
+        amount = text.split(maxsplit=1)[0]
+        return Decimal(amount)
+
+
 def calculate_pcp_pricing(
     pair: PcpPair,
     chain_slice: Any,
@@ -298,6 +416,8 @@ def calculate_pcp_pricing(
     put_quote = chain_slice.get_put_quote(strike)
     if call_quote is None or put_quote is None:
         return None
+    call_ts = int(getattr(call_quote, "ts_event", 0) or 0)
+    put_ts = int(getattr(put_quote, "ts_event", 0) or 0)
 
     call_prices = _quote_prices(call_quote)
     put_prices = _quote_prices(put_quote)
@@ -340,6 +460,10 @@ def calculate_pcp_pricing(
         hedge_ask_coin=hedge_ask,
         buy_synthetic_edge_coin=hedge_bid - synthetic_ask,
         sell_synthetic_edge_coin=synthetic_bid - hedge_ask,
+        call_ts_event=call_ts,
+        put_ts_event=put_ts,
+        swap_ts_event=swap_ts,
+        chain_ts_event=chain_ts,
     )
 
 
@@ -418,6 +542,16 @@ def evaluate_pcp_opportunity(
             hedge_bid_coin=pricing.hedge_bid_coin,
             hedge_ask_coin=pricing.hedge_ask_coin,
             edge_coin=pricing.buy_synthetic_edge_coin,
+            entry_mid_edge_coin=pricing.mid_edge_for(direction),
+            entry_executable_cost_coin=pricing.executable_cost_for(direction),
+            entry_bid_ask_spread_coin=pricing.executable_spread_coin,
+            call_spread=pricing.call_spread,
+            put_spread=pricing.put_spread,
+            swap_spread=pricing.swap_spread,
+            call_age_ms=quote_age_ms(now_ns, pricing.call_ts_event),
+            put_age_ms=quote_age_ms(now_ns, pricing.put_ts_event),
+            swap_age_ms=quote_age_ms(now_ns, pricing.swap_ts_event),
+            chain_age_ms=quote_age_ms(now_ns, pricing.chain_ts_event),
             open_legs=open_legs,
             basket_id=_basket_id(pair, direction),
         )
@@ -464,6 +598,16 @@ def evaluate_pcp_opportunity(
             hedge_bid_coin=pricing.hedge_bid_coin,
             hedge_ask_coin=pricing.hedge_ask_coin,
             edge_coin=pricing.sell_synthetic_edge_coin,
+            entry_mid_edge_coin=pricing.mid_edge_for(direction),
+            entry_executable_cost_coin=pricing.executable_cost_for(direction),
+            entry_bid_ask_spread_coin=pricing.executable_spread_coin,
+            call_spread=pricing.call_spread,
+            put_spread=pricing.put_spread,
+            swap_spread=pricing.swap_spread,
+            call_age_ms=quote_age_ms(now_ns, pricing.call_ts_event),
+            put_age_ms=quote_age_ms(now_ns, pricing.put_ts_event),
+            swap_age_ms=quote_age_ms(now_ns, pricing.swap_ts_event),
+            chain_age_ms=quote_age_ms(now_ns, pricing.chain_ts_event),
             open_legs=open_legs,
             basket_id=_basket_id(pair, direction),
         )
@@ -600,7 +744,7 @@ def failed_flatten_leg_for_position(position: Any, base_close_leg: OrderLegPlan)
 
 class PcpBasketLifecycle:
     """
-    Minimal basket lifecycle manager for three IOC legs.
+    Minimal basket lifecycle manager for three submitted legs.
 
     It deliberately does not hide residual risk. A reject/cancel/expiry before all
     target fills moves to FAILED_NEEDS_FLATTEN, which stops new entries and makes
@@ -703,6 +847,12 @@ class PcpBasketLifecycle:
         self._target_qty_by_instrument = {}
         self._filled_qty_by_instrument = {}
 
+    def begin_failed_flatten(self, opportunity: PcpOpportunity) -> None:
+        self.state = PcpBasketState.FAILED_NEEDS_FLATTEN
+        self.active_opportunity = opportunity
+        self.opened_at_ns = None
+        self.pending_since_ns = None
+
 
 class OKXPutCallParityConfig(StrategyConfig, frozen=True, kw_only=True):
     venue: Venue = Venue(OKX)
@@ -738,6 +888,7 @@ class OKXPutCallParityConfig(StrategyConfig, frozen=True, kw_only=True):
     close_edge_coin: Decimal = Decimal("0.0001")
     max_open_seconds: int = 60
     max_pending_seconds: int = 5
+    entry_cutoff_seconds: int = 0
     time_in_force: TimeInForce = TimeInForce.IOC
 
     dry_run: bool = True
@@ -765,8 +916,20 @@ class OKXPutCallParityStrategy(Strategy):
         self._last_status_ns = 0
         self._last_candidate_log_ns_by_basket_id: dict[str, int] = {}
         self._last_failed_flatten_submit_ns = 0
+        self._cycle_seq = 0
+        self._active_cycle: PcpCycleTelemetry | None = None
+        self._last_cycle_by_instrument: dict[InstrumentId, PcpCycleTelemetry] = {}
+        self._cycle_by_client_order_id: dict[str, PcpCycleTelemetry] = {}
+        self._order_instrument_by_client_order_id: dict[str, InstrumentId] = {}
+        self._pending_client_order_ids: set[str] = set()
+        self._entry_cutoff_ns: int | None = None
+        self._entry_cutoff_logged = False
 
     def on_start(self) -> None:
+        if self.config.entry_cutoff_seconds > 0:
+            self._entry_cutoff_ns = (
+                self.clock.timestamp_ns() + self.config.entry_cutoff_seconds * 1_000_000_000
+            )
         self._validate_config()
         self._refresh_from_cache()
         self._subscribe_coin_margined_swaps()
@@ -796,15 +959,13 @@ class OKXPutCallParityStrategy(Strategy):
 
         if self.config.execution_enabled and not self.config.dry_run:
             self._prepare_basket_for_stop()
+            self._cancel_pending_orders("node_stop")
 
         client_id = ClientId(OKX)
         for key in list(self._subscribed_series.values()):
             self.unsubscribe_option_chain(key.to_series_id(), client_id=client_id)
-        for record in self._records_by_id.values():
-            self.cancel_all_orders(instrument_id=record.instrument_id, client_id=client_id)
         for instrument_id in self.config.coin_margined_swap_ids:
             self.unsubscribe_quote_ticks(instrument_id=instrument_id, client_id=client_id)
-            self.cancel_all_orders(instrument_id=instrument_id, client_id=client_id)
 
         if (
             self._lifecycle.state == PcpBasketState.OPEN
@@ -833,24 +994,125 @@ class OKXPutCallParityStrategy(Strategy):
         self._scan()
 
     def on_order_filled(self, event: Any) -> None:
-        state = self._lifecycle.record_fill(
-            instrument_id=event.instrument_id,
-            last_qty=to_decimal(event.last_qty),
-            ts_event=int(getattr(event, "ts_event", self.clock.timestamp_ns())),
+        self._mark_order_terminal(event)
+        cycle = self._cycle_for_order_event(event)
+        if cycle is not None and self._active_cycle is not None and cycle is not self._active_cycle:
+            self.log.error(
+                "PCP stale order fill belongs to a previous cycle while another cycle is active "
+                f"| order_cycle_id={cycle.cycle_id} "
+                f"| active_cycle_id={self._active_cycle.cycle_id} "
+                f"| instrument={event.instrument_id} "
+                "| state=FAILED_NEEDS_FLATTEN",
+            )
+            self._mark_cycle_failed(
+                self._active_cycle,
+                "stale_fill_during_active_cycle",
+                self.clock.timestamp_ns(),
+            )
+            self._lifecycle.begin_failed_flatten(self._active_cycle.opportunity)
+            state = self._lifecycle.state
+        else:
+            state = self._lifecycle.record_fill(
+                instrument_id=event.instrument_id,
+                last_qty=to_decimal(event.last_qty),
+                ts_event=int(getattr(event, "ts_event", self.clock.timestamp_ns())),
+            )
+        self._record_cycle_fill(event, state, cycle=cycle)
+        self.log.info(
+            f"PCP basket fill | instrument={event.instrument_id} "
+            f"| state={state.value} "
+            f"| cycle_id={self._cycle_id_for_event(event)} "
+            f"| last_px={getattr(event, 'last_px', None)} "
+            "| fill_price_source=sandbox_order_filled.last_px",
         )
-        self.log.info(f"PCP basket fill | instrument={event.instrument_id} | state={state.value}")
+
+    def on_position_opened(self, event: Any) -> None:
+        cycle = self._cycle_for_position_opened_event(event)
+        if cycle is None:
+            return
+        now_ns = self.clock.timestamp_ns()
+        if self._lifecycle.state == PcpBasketState.FAILED_NEEDS_FLATTEN:
+            self._mark_cycle_failed(cycle, "late_fill_during_failed_flatten", now_ns)
+            self._active_cycle = cycle
+            self.log.error(
+                "PCP late fill opened while failed flatten is still active "
+                f"| cycle_id={cycle.cycle_id} "
+                f"| instrument={event.instrument_id} "
+                "| state=FAILED_NEEDS_FLATTEN",
+            )
+            self._maybe_flatten_failed_basket(now_ns)
+            return
+        if self._lifecycle.state != PcpBasketState.FLAT:
+            return
+        self._mark_cycle_failed(cycle, "late_fill_residual", now_ns)
+        self._lifecycle.begin_failed_flatten(cycle.opportunity)
+        self._active_cycle = cycle
+        self.log.error(
+            "PCP late fill opened a residual position after lifecycle was FLAT "
+            f"| cycle_id={cycle.cycle_id} "
+            f"| instrument={event.instrument_id} "
+            "| state=FAILED_NEEDS_FLATTEN",
+        )
+        self._maybe_flatten_failed_basket(now_ns)
+
+    def on_position_closed(self, event: Any) -> None:
+        cycle = self._cycle_for_position_event(event)
+        if cycle is None:
+            return
+        assert cycle.realized_pnl_by_currency is not None
+        assert cycle.closed_instruments is not None
+        realized_pnl = getattr(event, "realized_pnl", None)
+        if realized_pnl is not None:
+            currency = str(getattr(realized_pnl, "currency", "UNKNOWN"))
+            cycle.realized_pnl_by_currency[currency] = (
+                cycle.realized_pnl_by_currency.get(currency, Decimal(0))
+                + decimal_amount(realized_pnl)
+            )
+        cycle.closed_instruments.add(event.instrument_id)
+        self.log.info(
+            "PCP_POSITION_CLOSED "
+            f"| cycle_id={cycle.cycle_id} "
+            f"| instrument={event.instrument_id} "
+            f"| realized_pnl={realized_pnl} "
+            f"| duration_ns={getattr(event, 'duration_ns', None)}",
+        )
+        self._maybe_log_cycle_report(cycle)
 
     def on_order_rejected(self, event: Any) -> None:
+        cycle = self._cycle_for_order_event(event)
+        self._mark_order_terminal(event)
         self._handle_terminal_leg_event(event)
+        if self._lifecycle.state == PcpBasketState.FAILED_NEEDS_FLATTEN:
+            self._maybe_flatten_failed_basket(self.clock.timestamp_ns())
+        if cycle is not None:
+            self._maybe_log_cycle_report(cycle)
 
     def on_order_denied(self, event: Any) -> None:
+        cycle = self._cycle_for_order_event(event)
+        self._mark_order_terminal(event)
         self._handle_terminal_leg_event(event)
+        if self._lifecycle.state == PcpBasketState.FAILED_NEEDS_FLATTEN:
+            self._maybe_flatten_failed_basket(self.clock.timestamp_ns())
+        if cycle is not None:
+            self._maybe_log_cycle_report(cycle)
 
     def on_order_canceled(self, event: Any) -> None:
+        cycle = self._cycle_for_order_event(event)
+        self._mark_order_terminal(event)
         self._handle_terminal_leg_event(event)
+        if self._lifecycle.state == PcpBasketState.FAILED_NEEDS_FLATTEN:
+            self._maybe_flatten_failed_basket(self.clock.timestamp_ns())
+        if cycle is not None:
+            self._maybe_log_cycle_report(cycle)
 
     def on_order_expired(self, event: Any) -> None:
+        cycle = self._cycle_for_order_event(event)
+        self._mark_order_terminal(event)
         self._handle_terminal_leg_event(event)
+        if self._lifecycle.state == PcpBasketState.FAILED_NEEDS_FLATTEN:
+            self._maybe_flatten_failed_basket(self.clock.timestamp_ns())
+        if cycle is not None:
+            self._maybe_log_cycle_report(cycle)
 
     def _validate_config(self) -> None:
         if str(self.config.venue) == OKX and not self.config.instrument_family_codes:
@@ -889,8 +1151,13 @@ class OKXPutCallParityStrategy(Strategy):
         self._pairs = build_pcp_pairs(self._records_by_id.values())
 
     def _candidate_series_keys(self) -> list[OptionSeriesKey]:
+        paired_series = {pair.series_key for pair in self._pairs}
         return candidate_series_keys(
-            records=self._records_by_id.values(),
+            records=(
+                record
+                for record in self._records_by_id.values()
+                if record.series_key in paired_series
+            ),
             policy=self.config.series_subscription_policy,
             max_count=self.config.max_series_subscriptions,
         )
@@ -941,6 +1208,7 @@ class OKXPutCallParityStrategy(Strategy):
     def _scan(self) -> None:
         now_ns = self.clock.timestamp_ns()
         if self._maybe_fail_stale_pending_basket(now_ns):
+            self._maybe_flatten_failed_basket(now_ns)
             self._log_status(force=False)
             return
         if self._lifecycle.state == PcpBasketState.FAILED_NEEDS_FLATTEN:
@@ -952,7 +1220,17 @@ class OKXPutCallParityStrategy(Strategy):
             return
         if not self._lifecycle.can_submit_open():
             return
+        if self._pending_client_order_ids:
+            self._log_status(force=False)
+            return
+        if self._entry_cutoff_reached(now_ns):
+            self._log_status(force=False)
+            return
 
+        self._scan_for_open_opportunity(now_ns)
+        self._log_status(force=False)
+
+    def _scan_for_open_opportunity(self, now_ns: int) -> None:
         emitted = 0
         for pair in self._pairs:
             chain = self._latest_chains.get(str(pair.series_key.to_series_id()))
@@ -980,7 +1258,14 @@ class OKXPutCallParityStrategy(Strategy):
                 break
             if emitted >= self.config.max_opportunities_per_scan:
                 break
-        self._log_status(force=False)
+
+    def _entry_cutoff_reached(self, now_ns: int) -> bool:
+        if self._entry_cutoff_ns is None or now_ns < self._entry_cutoff_ns:
+            return False
+        if not self._entry_cutoff_logged:
+            self.log.info("PCP entry cutoff reached; no new baskets will be opened")
+            self._entry_cutoff_logged = True
+        return True
 
     def _maybe_close_open_basket(self, now_ns: int) -> None:
         opportunity = self._lifecycle.active_opportunity
@@ -1033,6 +1318,16 @@ class OKXPutCallParityStrategy(Strategy):
             f"| synthetic_ask={opportunity.synthetic_ask_coin} "
             f"| hedge_bid={opportunity.hedge_bid_coin} "
             f"| hedge_ask={opportunity.hedge_ask_coin} "
+            f"| entry_mid_edge_coin={opportunity.entry_mid_edge_coin} "
+            f"| entry_executable_cost_coin={opportunity.entry_executable_cost_coin} "
+            f"| entry_bid_ask_spread_coin={opportunity.entry_bid_ask_spread_coin} "
+            f"| call_spread={opportunity.call_spread} "
+            f"| put_spread={opportunity.put_spread} "
+            f"| swap_spread={opportunity.swap_spread} "
+            f"| call_age_ms={opportunity.call_age_ms} "
+            f"| put_age_ms={opportunity.put_age_ms} "
+            f"| swap_age_ms={opportunity.swap_age_ms} "
+            f"| chain_age_ms={opportunity.chain_age_ms} "
             f"| dry_run={self.config.dry_run} | {legs}",
             LogColor.CYAN,
         )
@@ -1051,13 +1346,265 @@ class OKXPutCallParityStrategy(Strategy):
             f"| swap_quotes={sorted(self._latest_swap_quotes)}",
         )
 
+    def _account_balance_totals(self) -> dict[str, Decimal]:
+        totals: dict[str, Decimal] = {}
+        for account in self.cache.accounts():
+            balances_total = account.balances_total()
+            for currency, money in balances_total.items():
+                currency_str = str(currency)
+                totals[currency_str] = totals.get(currency_str, Decimal(0)) + decimal_amount(money)
+        return totals
+
+    def _account_balance_delta(self, cycle: PcpCycleTelemetry) -> dict[str, Decimal]:
+        current = self._account_balance_totals()
+        currencies = set(cycle.entry_account_balances) | set(current)
+        return {
+            currency: current.get(currency, Decimal(0))
+            - cycle.entry_account_balances.get(currency, Decimal(0))
+            for currency in currencies
+        }
+
+    def _open_unrealized_by_currency(self, cycle: PcpCycleTelemetry) -> dict[str, Decimal]:
+        values: dict[str, Decimal] = {}
+        for position in self._open_positions_for_opportunity(cycle.opportunity):
+            unrealized_pnl = getattr(position, "unrealized_pnl", None)
+            if unrealized_pnl is None:
+                continue
+            currency = str(getattr(unrealized_pnl, "currency", "UNKNOWN"))
+            values[currency] = values.get(currency, Decimal(0)) + decimal_amount(unrealized_pnl)
+        return values
+
+    def _cycle_id_for_instrument(self, instrument_id: InstrumentId) -> int | None:
+        cycle = self._cycle_for_instrument(instrument_id)
+        return None if cycle is None else cycle.cycle_id
+
+    def _cycle_id_for_event(self, event: Any) -> int | None:
+        cycle = self._cycle_for_order_event(event) or self._cycle_for_instrument(event.instrument_id)
+        return None if cycle is None else cycle.cycle_id
+
+    def _cycle_for_instrument(self, instrument_id: InstrumentId) -> PcpCycleTelemetry | None:
+        if (
+            self._active_cycle is not None
+            and instrument_id in {leg.instrument_id for leg in self._active_cycle.opportunity.open_legs}
+        ):
+            return self._active_cycle
+        return self._last_cycle_by_instrument.get(instrument_id)
+
+    def _cycle_for_position_event(self, event: Any) -> PcpCycleTelemetry | None:
+        return (
+            self._cycle_by_order_id_attr(event, "opening_order_id")
+            or self._cycle_by_order_id_attr(event, "closing_order_id")
+            or self._cycle_for_instrument(event.instrument_id)
+        )
+
+    def _cycle_for_position_opened_event(self, event: Any) -> PcpCycleTelemetry | None:
+        return self._cycle_by_order_id_attr(event, "opening_order_id") or self._cycle_for_instrument(
+            event.instrument_id,
+        )
+
+    def _cycle_for_order_event(self, event: Any) -> PcpCycleTelemetry | None:
+        return self._cycle_by_order_id_attr(event, "client_order_id")
+
+    def _cycle_by_order_id_attr(self, event: Any, attr_name: str) -> PcpCycleTelemetry | None:
+        order_id = getattr(event, attr_name, None)
+        if order_id is None:
+            return None
+        return self._cycle_by_client_order_id.get(str(order_id))
+
+    def _mark_order_terminal(self, event: Any) -> None:
+        client_order_id = getattr(event, "client_order_id", None)
+        if client_order_id is not None:
+            self._pending_client_order_ids.discard(str(client_order_id))
+
+    def _has_pending_orders_for_cycle(self, cycle: PcpCycleTelemetry) -> bool:
+        return any(
+            self._cycle_by_client_order_id.get(client_order_id) is cycle
+            for client_order_id in self._pending_client_order_ids
+        )
+
+    def _pending_order_ids_for_cycle(self, cycle: PcpCycleTelemetry) -> list[str]:
+        return sorted(
+            client_order_id
+            for client_order_id in self._pending_client_order_ids
+            if self._cycle_by_client_order_id.get(client_order_id) is cycle
+        )
+
+    def _pending_order_instruments(self) -> list[InstrumentId]:
+        return sorted(
+            {
+                instrument_id
+                for client_order_id in self._pending_client_order_ids
+                if (
+                    instrument_id := self._order_instrument_by_client_order_id.get(
+                        client_order_id,
+                    )
+                )
+                is not None
+            },
+            key=str,
+        )
+
+    def _cancel_pending_orders(self, reason: str) -> None:
+        instruments = self._pending_order_instruments()
+        if not instruments:
+            return
+        for instrument_id in instruments:
+            self.cancel_all_orders(instrument_id=instrument_id, client_id=ClientId(OKX))
+        self.log.warning(
+            "PCP canceled pending tracked orders "
+            f"| reason={reason} "
+            f"| instruments={[str(instrument_id) for instrument_id in instruments]}",
+        )
+
+    def _cancel_unfilled_orders_for_cycle(
+        self,
+        cycle: PcpCycleTelemetry,
+        reason: str,
+    ) -> None:
+        filled_qty = self._lifecycle._filled_qty_by_instrument
+        target_qty = self._lifecycle._target_qty_by_instrument
+        instruments: set[InstrumentId] = set()
+        for client_order_id in self._pending_order_ids_for_cycle(cycle):
+            instrument_id = self._order_instrument_by_client_order_id.get(client_order_id)
+            if instrument_id is None:
+                continue
+            target = target_qty.get(instrument_id)
+            if target is not None and filled_qty.get(instrument_id, Decimal(0)) >= target:
+                continue
+            instruments.add(instrument_id)
+        if not instruments:
+            return
+        for instrument_id in sorted(instruments, key=str):
+            self.cancel_all_orders(instrument_id=instrument_id, client_id=ClientId(OKX))
+        self.log.warning(
+            "PCP canceled unresolved cycle orders "
+            f"| cycle_id={cycle.cycle_id} "
+            f"| reason={reason} "
+            f"| instruments={[str(instrument_id) for instrument_id in sorted(instruments, key=str)]}",
+        )
+
+    def _retire_report_blocking_orders_for_cycle(
+        self,
+        cycle: PcpCycleTelemetry,
+        reason: str,
+    ) -> None:
+        pending_order_ids = self._pending_order_ids_for_cycle(cycle)
+        if not pending_order_ids:
+            return
+        for client_order_id in pending_order_ids:
+            self._pending_client_order_ids.discard(client_order_id)
+        self.log.warning(
+            "PCP retired unresolved orders from failed cycle report gate "
+            f"| cycle_id={cycle.cycle_id} "
+            f"| reason={reason} "
+            f"| client_order_ids={pending_order_ids}",
+        )
+
+    def _record_cycle_fill(
+        self,
+        event: Any,
+        state: PcpBasketState,
+        cycle: PcpCycleTelemetry | None = None,
+    ) -> None:
+        if cycle is None:
+            cycle = self._cycle_for_instrument(event.instrument_id)
+        if cycle is None:
+            return
+        commission = getattr(event, "commission", None)
+        if commission is not None:
+            assert cycle.commissions_by_currency is not None
+            currency = str(getattr(commission, "currency", "UNKNOWN"))
+            cycle.commissions_by_currency[currency] = (
+                cycle.commissions_by_currency.get(currency, Decimal(0))
+                + decimal_amount(commission)
+            )
+        if state == PcpBasketState.FLAT and cycle.closed_at_ns is None:
+            event_ns = int(getattr(event, "ts_event", self.clock.timestamp_ns()))
+            cycle.mark_normal_close(
+                max(
+                    self.clock.timestamp_ns(),
+                    event_ns,
+                    cycle.exit_submit_ns or 0,
+                    cycle.opened_submit_ns,
+                ),
+            )
+
+    @staticmethod
+    def _mark_cycle_failed(
+        cycle: PcpCycleTelemetry | None,
+        reason: str,
+        failed_at_ns: int | None = None,
+    ) -> None:
+        if cycle is None:
+            return
+        cycle.mark_failed(reason, failed_at_ns=failed_at_ns)
+
+    def _maybe_log_cycle_report(self, cycle: PcpCycleTelemetry) -> None:
+        assert cycle.closed_instruments is not None
+        if cycle.report_logged:
+            return
+        if self._lifecycle.state != PcpBasketState.FLAT:
+            return
+        if self._has_pending_orders_for_cycle(cycle):
+            return
+        expected = {leg.instrument_id for leg in cycle.opportunity.open_legs}
+        if not expected.issubset(cycle.closed_instruments) and not cycle.closed_instruments:
+            return
+        lifecycle_total_seconds = None
+        if cycle.closed_at_ns is not None:
+            lifecycle_total_seconds = elapsed_seconds(cycle.opened_submit_ns, cycle.closed_at_ns)
+        cycle.report_logged = True
+        self.log.info(
+            "PCP_CYCLE_REPORT "
+            f"| cycle_id={cycle.cycle_id} "
+            f"| basket_id={cycle.opportunity.basket_id} "
+            f"| direction={cycle.opportunity.direction.value} "
+            f"| lifecycle_total_seconds={lifecycle_total_seconds} "
+            f"| close_path={cycle.close_path} "
+            f"| failure_reason={cycle.failure_reason} "
+            f"| account_balance_delta={decimal_map_to_str(self._account_balance_delta(cycle))} "
+            f"| position_closed_realized_pnl={decimal_map_to_str(cycle.realized_pnl_by_currency or {})} "
+            f"| fees={decimal_map_to_str(cycle.commissions_by_currency or {})} "
+            f"| open_unrealized={decimal_map_to_str(self._open_unrealized_by_currency(cycle))} "
+            f"| current_state={self._lifecycle.state.value}",
+        )
+
     def _submit_open_orders(self, opportunity: PcpOpportunity) -> None:
+        self._start_cycle(opportunity)
         self._lifecycle.begin_open(opportunity, now_ns=self.clock.timestamp_ns())
         for leg in opportunity.open_legs:
             if not self._submit_leg(leg, basket_id=opportunity.basket_id):
                 self._lifecycle.record_terminal_without_full_fill()
                 return
         self.log.info(f"PCP basket submitted | basket_id={opportunity.basket_id}", LogColor.GREEN)
+
+    def _start_cycle(self, opportunity: PcpOpportunity) -> None:
+        self._cycle_seq += 1
+        cycle = PcpCycleTelemetry(
+            cycle_id=self._cycle_seq,
+            opportunity=opportunity,
+            opened_submit_ns=self.clock.timestamp_ns(),
+            entry_account_balances=self._account_balance_totals(),
+        )
+        self._active_cycle = cycle
+        for leg in opportunity.open_legs:
+            self._last_cycle_by_instrument[leg.instrument_id] = cycle
+        self.log.info(
+            "PCP_ENTRY_OBS "
+            f"| cycle_id={cycle.cycle_id} "
+            f"| basket_id={opportunity.basket_id} "
+            f"| entry_mid_edge_coin={opportunity.entry_mid_edge_coin} "
+            f"| entry_executable_cost_coin={opportunity.entry_executable_cost_coin} "
+            f"| entry_bid_ask_spread_coin={opportunity.entry_bid_ask_spread_coin} "
+            f"| call_spread={opportunity.call_spread} "
+            f"| put_spread={opportunity.put_spread} "
+            f"| swap_spread={opportunity.swap_spread} "
+            f"| call_age_ms={opportunity.call_age_ms} "
+            f"| put_age_ms={opportunity.put_age_ms} "
+            f"| swap_age_ms={opportunity.swap_age_ms} "
+            f"| chain_age_ms={opportunity.chain_age_ms} "
+            f"| account_balances={decimal_map_to_str(cycle.entry_account_balances)}",
+        )
 
     def _submit_close_orders(self, reason: str) -> None:
         opportunity = self._lifecycle.active_opportunity
@@ -1072,14 +1619,62 @@ class OKXPutCallParityStrategy(Strategy):
         close_legs = build_close_legs(opportunity, chain, swap_quote, self.config.time_in_force)
         if close_legs is None:
             self._lifecycle.record_terminal_without_full_fill()
-            self.log.error(f"Cannot close PCP basket; invalid close quotes | reason={reason}")
+            self.log.warning(f"Cannot close PCP basket; invalid close quotes | reason={reason}")
             return
+        self._record_exit_observation(opportunity, chain, swap_quote, reason)
         self._lifecycle.begin_close(close_legs, now_ns=self.clock.timestamp_ns())
         for leg in close_legs:
             if not self._submit_leg(leg, basket_id=f"{opportunity.basket_id}:close"):
                 self._lifecycle.record_terminal_without_full_fill()
                 return
         self.log.info(f"PCP close basket submitted | reason={reason}", LogColor.YELLOW)
+
+    def _record_exit_observation(
+        self,
+        opportunity: PcpOpportunity,
+        chain: Any,
+        swap_quote: QuoteTick,
+        reason: str,
+    ) -> None:
+        cycle = self._active_cycle
+        if cycle is None:
+            return
+        now_ns = self.clock.timestamp_ns()
+        pricing = calculate_pcp_pricing(
+            pair=opportunity.pair,
+            chain_slice=chain,
+            swap_quote=swap_quote,
+            now_ns=now_ns,
+            stale_quote_ms=self.config.stale_quote_ms,
+            max_cross_source_skew_ms=self.config.max_cross_source_skew_ms,
+        )
+        if pricing is None:
+            return
+        held_seconds = None
+        if self._lifecycle.opened_at_ns is not None:
+            held_seconds = elapsed_seconds(self._lifecycle.opened_at_ns, now_ns)
+        cycle.exit_submit_ns = now_ns
+        cycle.exit_reason = reason
+        cycle.exit_mid_edge_coin = pricing.mid_edge_for(opportunity.direction)
+        cycle.exit_executable_value_coin = pricing.edge_for(opportunity.direction)
+        cycle.exit_bid_ask_spread_coin = pricing.executable_spread_coin
+        self.log.info(
+            "PCP_EXIT_OBS "
+            f"| cycle_id={cycle.cycle_id} "
+            f"| basket_id={opportunity.basket_id} "
+            f"| reason={reason} "
+            f"| exit_mid_edge_coin={cycle.exit_mid_edge_coin} "
+            f"| exit_executable_value_coin={cycle.exit_executable_value_coin} "
+            f"| exit_bid_ask_spread_coin={cycle.exit_bid_ask_spread_coin} "
+            f"| call_spread={pricing.call_spread} "
+            f"| put_spread={pricing.put_spread} "
+            f"| swap_spread={pricing.swap_spread} "
+            f"| call_age_ms={quote_age_ms(now_ns, pricing.call_ts_event)} "
+            f"| put_age_ms={quote_age_ms(now_ns, pricing.put_ts_event)} "
+            f"| swap_age_ms={quote_age_ms(now_ns, pricing.swap_ts_event)} "
+            f"| chain_age_ms={quote_age_ms(now_ns, pricing.chain_ts_event)} "
+            f"| lifecycle_held_seconds={held_seconds}",
+        )
 
     def _maybe_fail_stale_pending_basket(self, now_ns: int) -> bool:
         previous_state = self._lifecycle.state
@@ -1105,6 +1700,9 @@ class OKXPutCallParityStrategy(Strategy):
             f"| filled={filled} | target={targets} "
             "| state=FAILED_NEEDS_FLATTEN",
         )
+        self._mark_cycle_failed(self._active_cycle, "pending_timeout", now_ns)
+        if self._active_cycle is not None:
+            self._cancel_unfilled_orders_for_cycle(self._active_cycle, "pending_timeout")
         return True
 
     def _maybe_flatten_failed_basket(self, now_ns: int) -> None:
@@ -1114,11 +1712,7 @@ class OKXPutCallParityStrategy(Strategy):
 
         positions = self._open_positions_for_opportunity(opportunity)
         if not positions:
-            self._lifecycle.mark_flat_after_failed_flatten()
-            self.log.warning(
-                "PCP failed basket flatten complete; no related open positions remain "
-                "| state=FLAT",
-            )
+            self._complete_failed_flatten_without_positions(now_ns)
             return
 
         min_interval_ns = self.config.max_pending_seconds * 1_000_000_000
@@ -1132,7 +1726,7 @@ class OKXPutCallParityStrategy(Strategy):
             return
         close_legs = build_close_legs(opportunity, chain, swap_quote, self.config.time_in_force)
         if close_legs is None:
-            self.log.error("Cannot flatten failed PCP basket; invalid close quotes")
+            self.log.warning("Cannot flatten failed PCP basket; invalid close quotes")
             return
 
         submitted = self._submit_failed_flatten_legs(opportunity, positions, close_legs)
@@ -1143,6 +1737,42 @@ class OKXPutCallParityStrategy(Strategy):
                 f"| legs={submitted} "
                 "| state=FAILED_NEEDS_FLATTEN",
             )
+
+    def _complete_failed_flatten_without_positions(self, now_ns: int) -> None:
+        cycle = self._active_cycle
+        if cycle is not None and self._has_pending_orders_for_cycle(cycle):
+            self._cancel_unfilled_orders_for_cycle(
+                cycle,
+                "failed_flatten_waiting_for_terminal_orders",
+            )
+            failed_at_ns = cycle.failed_at_ns
+            pending_wait_ns = self.config.max_pending_seconds * 1_000_000_000
+            if failed_at_ns is None or now_ns - failed_at_ns < pending_wait_ns:
+                self.log.warning(
+                    "PCP failed basket flatten waiting for unresolved order terminals "
+                    f"| cycle_id={cycle.cycle_id} "
+                    f"| pending_client_order_ids={self._pending_order_ids_for_cycle(cycle)} "
+                    "| state=FAILED_NEEDS_FLATTEN",
+                )
+                return
+            self._retire_report_blocking_orders_for_cycle(
+                cycle,
+                "failed_flatten_terminal_wait_elapsed",
+            )
+        self._lifecycle.mark_flat_after_failed_flatten()
+        self._mark_cycle_failed(cycle, "failed_flatten_complete")
+        if cycle is not None and cycle.closed_at_ns is None:
+            cycle.closed_at_ns = max(
+                now_ns,
+                cycle.exit_submit_ns or 0,
+                cycle.opened_submit_ns,
+            )
+        self.log.warning(
+            "PCP failed basket flatten complete; no related open positions remain "
+            "| state=FLAT",
+        )
+        if cycle is not None:
+            self._maybe_log_cycle_report(cycle)
 
     def _prepare_basket_for_stop(self) -> None:
         state = self._lifecycle.state
@@ -1207,17 +1837,36 @@ class OKXPutCallParityStrategy(Strategy):
             reduce_only=leg.reduce_only,
             tags=[basket_id, leg.role],
         )
+        if self._active_cycle is not None:
+            client_order_id = str(order.client_order_id)
+            self._cycle_by_client_order_id[client_order_id] = self._active_cycle
+            self._order_instrument_by_client_order_id[client_order_id] = leg.instrument_id
+            self._pending_client_order_ids.add(client_order_id)
         self.submit_order(order)
         return True
 
     def _handle_terminal_leg_event(self, event: Any) -> None:
+        previous_state = self._lifecycle.state
         state = self._lifecycle.record_terminal_without_full_fill()
-        if state == PcpBasketState.FAILED_NEEDS_FLATTEN:
-            self.log.error(
-                "PCP basket terminal leg event before full fill "
+        if state != PcpBasketState.FAILED_NEEDS_FLATTEN:
+            return
+        if previous_state == PcpBasketState.FAILED_NEEDS_FLATTEN:
+            self.log.warning(
+                "PCP basket terminal leg event acknowledged after failure "
                 f"| instrument={getattr(event, 'instrument_id', None)} "
                 "| state=FAILED_NEEDS_FLATTEN",
             )
+            return
+        self._mark_cycle_failed(
+            self._active_cycle,
+            "terminal_leg_event",
+            self.clock.timestamp_ns(),
+        )
+        self.log.error(
+            "PCP basket terminal leg event before full fill "
+            f"| instrument={getattr(event, 'instrument_id', None)} "
+            "| state=FAILED_NEEDS_FLATTEN",
+        )
 
 
 def _parse_csv_tuple(raw: str) -> tuple[str, ...]:
@@ -1269,6 +1918,15 @@ def _parse_environment(raw: str) -> OKXEnvironment:
     if normalized == "DEMO":
         return OKXEnvironment.DEMO
     raise ValueError(f"Unsupported OKX environment: {raw}")
+
+
+def _parse_time_in_force(raw: str) -> TimeInForce:
+    normalized = raw.strip().upper()
+    try:
+        return TimeInForce[normalized]
+    except KeyError as exc:
+        valid = ", ".join(member.name for member in TimeInForce)
+        raise ValueError(f"Unsupported time_in_force: {raw}; expected one of {valid}") from exc
 
 
 def build_node_components(
@@ -1362,6 +2020,8 @@ def build_node_components(
         min_edge_coin=Decimal(args.min_edge_coin),
         close_edge_coin=Decimal(args.close_edge_coin),
         max_open_seconds=args.max_open_seconds,
+        entry_cutoff_seconds=args.entry_cutoff_seconds,
+        time_in_force=_parse_time_in_force(args.time_in_force),
         dry_run=args.dry_run,
         execution_enabled=args.enable_execution,
         use_hyphens_in_client_order_ids=False,
@@ -1447,6 +2107,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-edge-coin", default="0.0005")
     parser.add_argument("--close-edge-coin", default="0.0001")
     parser.add_argument("--max-open-seconds", type=int, default=60)
+    parser.add_argument(
+        "--time-in-force",
+        choices=[member.name for member in TimeInForce],
+        default="GTC",
+        help=(
+            "Order time in force for the local sandbox execution client. GTC lets the "
+            "strategy own pending timeout and explicit cancel handling."
+        ),
+    )
+    parser.add_argument(
+        "--entry-cutoff-seconds",
+        type=int,
+        default=0,
+        help="Stop opening new PCP baskets this many seconds after strategy start; existing baskets may still close.",
+    )
     parser.add_argument("--run-seconds", type=int, default=0)
     parser.add_argument("--trader-id", default="OKX-PCP-001")
     parser.add_argument("--log-level", default="INFO")

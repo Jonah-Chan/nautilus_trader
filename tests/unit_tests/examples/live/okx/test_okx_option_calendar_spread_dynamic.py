@@ -19,18 +19,58 @@ from decimal import Decimal
 import pandas as pd
 import pytest
 
-from examples.live.okx.okx_option_calendar_spread_dynamic import CalendarBasketLifecycle
-from examples.live.okx.okx_option_calendar_spread_dynamic import CalendarBasketState
-from examples.live.okx.okx_option_calendar_spread_dynamic import build_calendar_pairs
-from examples.live.okx.okx_option_calendar_spread_dynamic import build_close_legs
-from examples.live.okx.okx_option_calendar_spread_dynamic import build_close_legs_from_quotes
-from examples.live.okx.okx_option_calendar_spread_dynamic import build_node_components
-from examples.live.okx.okx_option_calendar_spread_dynamic import calendar_pair_key
-from examples.live.okx.okx_option_calendar_spread_dynamic import evaluate_calendar_opportunity
-from examples.live.okx.okx_option_calendar_spread_dynamic import parse_args
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    CalendarBasketLifecycle,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    CalendarBasketState,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    _order_pairs_for_scan,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    _quote_age_ms,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    _quote_mid,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    _quote_spread,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    build_calendar_pairs,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    build_close_legs,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    build_close_legs_from_quotes,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    build_node_components,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    calendar_pair_key,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    evaluate_calendar_opportunity,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    parse_args,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    plan_active_leg_quote_reassertions,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    plan_option_chain_subscription_sync,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
+    should_stop_after_flat,
+)
 from examples.live.okx.okx_option_core import NS_PER_DAY
 from examples.live.okx.okx_option_core import OptionTimeFilter
 from examples.live.okx.okx_option_core import build_strike_range
+from examples.live.okx.okx_option_core import candidate_series_keys
 from examples.live.okx.okx_option_core import normalize_option_instrument
 from examples.live.okx.okx_option_core import normalize_option_kind
 from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
@@ -114,6 +154,39 @@ class FakeChain:
         return None
 
 
+def _btc_calendar_fixture():
+    near = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+    far = normalize_option_instrument(
+        _okx_option("BTC-USD-260925-70000-C", BTC, SEP_EXPIRY),
+        ("BTC",),
+    )
+    pair = build_calendar_pairs([near, far], expiry_pair_mode="all")[0]
+    now_ns = 1_000_000_000_000
+    near_chain = FakeChain(
+        ts_event=now_ns,
+        calls={near.strike_price: _quote(near.instrument_id, "0.10", "0.11", now_ns)},
+    )
+    far_chain = FakeChain(
+        ts_event=now_ns,
+        calls={far.strike_price: _quote(far.instrument_id, "0.14", "0.15", now_ns)},
+    )
+    opportunity = evaluate_calendar_opportunity(
+        pair=pair,
+        near_chain=near_chain,
+        far_chain=far_chain,
+        now_ns=now_ns,
+        stale_quote_ms=5_000,
+        max_cross_series_skew_ms=1_000,
+        order_qty=Decimal(1),
+        time_in_force=TimeInForce.IOC,
+    )
+    assert opportunity is not None
+    return near, far, near_chain, far_chain, opportunity, now_ns
+
+
 def test_normalize_crypto_option_uses_currency_underlying_code_and_settlement_currency():
     # 保护 OKX series 生成的关键口径:underlying 用 BTC/ETH 代码,settlement_currency
     # 必须来自 instrument 本身。inverse option 不能被误归到 USD settlement series。
@@ -169,6 +242,12 @@ def test_normalize_crypto_option_uses_currency_underlying_code_and_settlement_cu
     )
 
 
+def test_normalize_option_instrument_rejects_unsupported_okx_um_symbol():
+    instrument = _okx_option("BTC-USD_UM-260626-70000-C", BTC, JUN_EXPIRY)
+
+    assert normalize_option_instrument(instrument, ("BTC", "ETH")) is None
+
+
 def test_option_time_filter_keeps_policy_outside_instrument_record():
     # OptionInstrumentRecord 只暴露时间事实;DTE/blackout 等策略口径由外部 filter 承接。
     record = normalize_option_instrument(
@@ -189,6 +268,23 @@ def test_option_time_filter_keeps_policy_outside_instrument_record():
     assert not time_filter.allows(replace(record, activation_ns=now_ns + 1), now_ns)
     assert not time_filter.allows(replace(record, expiration_ns=now_ns - 1), now_ns)
     assert not time_filter.allows(replace(record, expiration_ns=now_ns + NS_PER_DAY * 31), now_ns)
+
+
+def test_option_time_filter_rejects_recently_activated_contracts():
+    record = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC",),
+    )
+    now_ns = JUN_EXPIRY - (10 * NS_PER_DAY)
+    time_filter = OptionTimeFilter(
+        min_dte_days=1,
+        max_dte_days=30,
+        expiry_blackout_minutes=60,
+        min_activation_age_seconds=300,
+    )
+
+    assert not time_filter.allows(replace(record, activation_ns=now_ns - 299_000_000_000), now_ns)
+    assert time_filter.allows(replace(record, activation_ns=now_ns - 300_000_000_000), now_ns)
 
 
 def test_option_time_filter_rejects_expiry_blackout_window():
@@ -272,6 +368,87 @@ def test_build_calendar_pairs_keeps_btc_and_eth_universes_separate():
 
     assert len(pairs) == 2
     assert {pair.near.underlying_code for pair in pairs} == {"BTC", "ETH"}
+
+
+def test_ranked_active_series_does_not_starve_eth_when_subscription_count_is_capped():
+    records = [
+        normalize_option_instrument(
+            _okx_option(f"BTC-USD-{date}-70000-C", BTC, expiry),
+            ("BTC", "ETH"),
+        )
+        for date, expiry in [
+            ("260626", JUN_EXPIRY),
+            ("260925", SEP_EXPIRY),
+            ("261225", DEC_EXPIRY),
+        ]
+    ]
+    records.extend(
+        normalize_option_instrument(
+            _okx_option(f"ETH-USD-{date}-4000-C", ETH, expiry, strike="4000"),
+            ("BTC", "ETH"),
+        )
+        for date, expiry in [
+            ("260626", JUN_EXPIRY),
+            ("260925", SEP_EXPIRY),
+        ]
+    )
+
+    keys = candidate_series_keys(records, policy="ranked_active_series", max_count=4)
+
+    assert [key.underlying_code for key in keys] == ["BTC", "ETH", "BTC", "ETH"]
+    assert [key.expiration_ns for key in keys] == [JUN_EXPIRY, JUN_EXPIRY, SEP_EXPIRY, SEP_EXPIRY]
+
+
+def test_execution_scan_order_rotates_underlyings_for_flow_validation_coverage():
+    records = [
+        normalize_option_instrument(
+            _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+            ("BTC", "ETH"),
+        ),
+        normalize_option_instrument(
+            _okx_option("BTC-USD-260925-70000-C", BTC, SEP_EXPIRY),
+            ("BTC", "ETH"),
+        ),
+        normalize_option_instrument(
+            _okx_option("ETH-USD-260626-4000-C", ETH, JUN_EXPIRY, strike="4000"),
+            ("BTC", "ETH"),
+        ),
+        normalize_option_instrument(
+            _okx_option("ETH-USD-260925-4000-C", ETH, SEP_EXPIRY, strike="4000"),
+            ("BTC", "ETH"),
+        ),
+    ]
+    pairs = build_calendar_pairs(records, expiry_pair_mode="all")
+
+    rotated = _order_pairs_for_scan(pairs, ("BTC", "ETH"), last_submitted_underlying="BTC")
+
+    assert rotated[0].near.underlying_code == "ETH"
+
+
+def test_subscription_sync_plan_resubscribes_missing_series_and_removes_inactive_series():
+    desired_btc = normalize_option_instrument(
+        _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
+        ("BTC", "ETH"),
+    ).series_key
+    desired_eth = normalize_option_instrument(
+        _okx_option("ETH-USD-260626-4000-C", ETH, JUN_EXPIRY, strike="4000"),
+        ("BTC", "ETH"),
+    ).series_key
+    stale_btc = normalize_option_instrument(
+        _okx_option("BTC-USD-260925-70000-C", BTC, SEP_EXPIRY),
+        ("BTC", "ETH"),
+    ).series_key
+
+    sync = plan_option_chain_subscription_sync(
+        current_by_series_id={
+            str(desired_btc.to_series_id()): desired_btc,
+            str(stale_btc.to_series_id()): stale_btc,
+        },
+        desired_keys=[desired_btc, desired_eth],
+    )
+
+    assert sync.to_subscribe == (desired_eth,)
+    assert sync.to_unsubscribe == (stale_btc,)
 
 
 def test_default_strike_range_policy_does_not_request_all_strikes():
@@ -376,6 +553,15 @@ def test_opportunity_emits_executable_dry_run_leg_parameters_from_bid_ask():
     assert far_leg.instrument_id == far.instrument_id
     assert far_leg.side == OrderSide.BUY
     assert far_leg.limit_price == Decimal("0.15")
+
+
+def test_quote_observability_metrics_use_bid_ask_and_quote_age():
+    instrument_id = InstrumentId.from_str("BTC-USD-260626-70000-C.OKX")
+    quote = _quote(instrument_id, bid="0.10", ask="0.14", ts_event=1_000_000_000)
+
+    assert _quote_mid(quote) == Decimal("0.12")
+    assert _quote_spread(quote) == Decimal("0.04")
+    assert _quote_age_ms(quote, now_ns=1_250_000_000) == Decimal(250)
 
 
 def test_opportunity_fails_closed_when_cross_series_snapshot_skew_is_too_large():
@@ -519,6 +705,44 @@ def test_close_legs_can_use_direct_leg_quote_ticks_when_chain_slice_drops_strike
     assert far_close.reduce_only
 
 
+def test_close_legs_fail_closed_when_close_quote_is_missing():
+    near, far, _near_chain, far_chain, opportunity, now_ns = _btc_calendar_fixture()
+
+    assert build_close_legs_from_quotes(
+        opportunity=opportunity,
+        near_quote=None,
+        far_quote=_quote(far.instrument_id, "0.13", "0.15", now_ns),
+        time_in_force=TimeInForce.IOC,
+    ) is None
+    assert build_close_legs(
+        opportunity=opportunity,
+        near_chain=FakeChain(ts_event=now_ns, calls={}),
+        far_chain=far_chain,
+        time_in_force=TimeInForce.IOC,
+    ) is None
+
+
+def test_active_leg_quote_reassertion_is_throttled_when_quote_is_missing():
+    near_id = InstrumentId.from_str("ETH-USD-260524-2100-C.OKX")
+    far_id = InstrumentId.from_str("ETH-USD-260525-2100-C.OKX")
+    now_ns = 30_000_000_000
+
+    assert plan_active_leg_quote_reassertions(
+        active_instrument_ids=(near_id, far_id),
+        latest_quote_ids={far_id},
+        last_request_ns_by_id={near_id: 25_000_000_000},
+        now_ns=now_ns,
+        min_interval_ns=10_000_000_000,
+    ) == ()
+    assert plan_active_leg_quote_reassertions(
+        active_instrument_ids=(near_id, far_id),
+        latest_quote_ids={far_id},
+        last_request_ns_by_id={near_id: 19_000_000_000},
+        now_ns=now_ns,
+        min_interval_ns=10_000_000_000,
+    ) == (near_id,)
+
+
 def test_calendar_basket_lifecycle_requires_all_open_and_close_fills():
     near = normalize_option_instrument(
         _okx_option("BTC-USD-260626-70000-C", BTC, JUN_EXPIRY),
@@ -603,6 +827,110 @@ def test_calendar_basket_lifecycle_terminal_partial_fill_requires_flatten():
     assert not lifecycle.can_submit_open()
 
 
+def test_calendar_basket_lifecycle_ioc_partial_cancel_requires_flatten():
+    near, _far, _near_chain, _far_chain, opportunity, now_ns = _btc_calendar_fixture()
+    lifecycle = CalendarBasketLifecycle()
+
+    lifecycle.begin_open(opportunity)
+    assert lifecycle.record_fill(
+        near.instrument_id,
+        Decimal("0.25"),
+        now_ns,
+    ) == CalendarBasketState.OPENING
+
+    assert lifecycle.record_terminal_without_full_fill() == CalendarBasketState.FAILED_NEEDS_FLATTEN
+    assert not lifecycle.can_submit_open()
+
+
+def test_calendar_basket_lifecycle_reduce_only_reject_while_closing_requires_flatten():
+    near, far, near_chain, far_chain, opportunity, now_ns = _btc_calendar_fixture()
+    lifecycle = CalendarBasketLifecycle()
+
+    lifecycle.begin_open(opportunity)
+    lifecycle.record_fill(near.instrument_id, Decimal(1), now_ns)
+    lifecycle.record_fill(far.instrument_id, Decimal(1), now_ns)
+    lifecycle.begin_close(build_close_legs(opportunity, near_chain, far_chain, TimeInForce.IOC))
+
+    assert lifecycle.record_terminal_without_full_fill() == CalendarBasketState.FAILED_NEEDS_FLATTEN
+    assert not lifecycle.can_submit_open()
+
+
+def test_calendar_basket_lifecycle_restart_with_existing_position_blocks_new_entries():
+    lifecycle = CalendarBasketLifecycle()
+    lifecycle.mark_scanning()
+
+    assert lifecycle.record_existing_open_positions(position_count=2) == CalendarBasketState.FAILED_NEEDS_FLATTEN
+    assert not lifecycle.can_submit_open()
+
+
+def test_should_stop_after_flat_requires_completed_flat_and_elapsed_runtime():
+    started_ns = 1_000_000_000
+    stop_after_seconds = 60
+
+    assert not should_stop_after_flat(
+        state=CalendarBasketState.OPEN,
+        completed_basket_count=1,
+        started_ns=started_ns,
+        now_ns=started_ns + 60_000_000_000,
+        stop_after_flat_seconds=stop_after_seconds,
+        stop_after_completed_baskets=0,
+    )
+    assert not should_stop_after_flat(
+        state=CalendarBasketState.FLAT,
+        completed_basket_count=0,
+        started_ns=started_ns,
+        now_ns=started_ns + 60_000_000_000,
+        stop_after_flat_seconds=stop_after_seconds,
+        stop_after_completed_baskets=0,
+    )
+    assert not should_stop_after_flat(
+        state=CalendarBasketState.FLAT,
+        completed_basket_count=1,
+        started_ns=started_ns,
+        now_ns=started_ns + 59_999_999_999,
+        stop_after_flat_seconds=stop_after_seconds,
+        stop_after_completed_baskets=0,
+    )
+    assert should_stop_after_flat(
+        state=CalendarBasketState.FLAT,
+        completed_basket_count=1,
+        started_ns=started_ns,
+        now_ns=started_ns + 60_000_000_000,
+        stop_after_flat_seconds=stop_after_seconds,
+        stop_after_completed_baskets=0,
+    )
+
+
+def test_should_stop_after_flat_accepts_completed_basket_sample_target():
+    started_ns = 1_000_000_000
+    now_ns = started_ns + 5_000_000_000
+
+    assert not should_stop_after_flat(
+        state=CalendarBasketState.OPEN,
+        completed_basket_count=144,
+        started_ns=started_ns,
+        now_ns=now_ns,
+        stop_after_flat_seconds=0,
+        stop_after_completed_baskets=144,
+    )
+    assert not should_stop_after_flat(
+        state=CalendarBasketState.FLAT,
+        completed_basket_count=143,
+        started_ns=started_ns,
+        now_ns=now_ns,
+        stop_after_flat_seconds=0,
+        stop_after_completed_baskets=144,
+    )
+    assert should_stop_after_flat(
+        state=CalendarBasketState.FLAT,
+        completed_basket_count=144,
+        started_ns=started_ns,
+        now_ns=now_ns,
+        stop_after_flat_seconds=0,
+        stop_after_completed_baskets=144,
+    )
+
+
 def test_build_node_components_defaults_to_live_data_and_system_sandbox_execution():
     args = parse_args(["--enable-execution", "--no-dry-run"])
 
@@ -620,6 +948,33 @@ def test_build_node_components_defaults_to_live_data_and_system_sandbox_executio
     assert strategy_config.instrument_family_codes == ("BTC-USD", "ETH-USD")
     assert not strategy_config.dry_run
     assert strategy_config.execution_enabled
+    assert strategy_config.stop_after_flat_seconds == 0
+    assert strategy_config.stop_after_completed_baskets == 0
+    assert strategy_config.time_in_force == TimeInForce.IOC
+
+
+def test_build_node_components_accepts_stop_after_flat_seconds():
+    args = parse_args(["--stop-after-flat-seconds", "900"])
+
+    _, strategy_config = build_node_components(args)
+
+    assert strategy_config.stop_after_flat_seconds == 900
+
+
+def test_build_node_components_accepts_stop_after_completed_baskets():
+    args = parse_args(["--stop-after-completed-baskets", "144"])
+
+    _, strategy_config = build_node_components(args)
+
+    assert strategy_config.stop_after_completed_baskets == 144
+
+
+def test_build_node_components_accepts_custom_time_in_force():
+    args = parse_args(["--time-in-force", "GTC"])
+
+    _, strategy_config = build_node_components(args)
+
+    assert strategy_config.time_in_force == TimeInForce.GTC
 
 
 def test_build_node_components_accepts_custom_sandbox_starting_balances():
