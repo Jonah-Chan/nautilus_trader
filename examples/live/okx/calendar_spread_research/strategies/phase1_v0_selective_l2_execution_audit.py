@@ -28,7 +28,10 @@ import argparse
 import sys
 from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC
+from datetime import datetime
 from decimal import Decimal
+from decimal import InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -581,6 +584,76 @@ def _quote_age_ms_for_leg(
         return None
     return Decimal(now_ns - ts_event) / Decimal(1_000_000)
 
+_EXECUTION_AUDIT_DECIMAL_PLACES_BY_FIELD = {
+    "subscription_age_ms": 3,
+    "last_request_age_ms": 3,
+    "first_depth_latency_ms": 3,
+    "last_depth_update_age_ms": 3,
+    "quote_age_ms": 3,
+    "book_age_ms": 3,
+    "near_dte_days": 2,
+    "far_dte_days": 2,
+    "strike_moneyness": 4,
+    "near_iv": 6,
+    "far_iv": 6,
+    "term_structure_slope": 6,
+    "fair_value_estimate": 8,
+    "requested_qty": 8,
+    "executable_qty": 8,
+    "vwap_price": 8,
+    "worst_price": 8,
+    "notional": 8,
+}
+
+
+def _format_decimal_for_execution_audit_log(value: Decimal, places: int) -> str:
+    quantum = Decimal(1).scaleb(-places)
+    try:
+        rounded = value.quantize(quantum)
+    except InvalidOperation:
+        return str(value)
+    text = format(rounded, "f")
+    if "." not in text:
+        return text
+    return text.rstrip("0").rstrip(".") or "0"
+
+
+def _format_expiration_ns_for_execution_audit_log(value: str) -> str:
+    if not value.isdigit():
+        return value
+    expiration_ns = int(value)
+    if expiration_ns < 100_000_000_000_000_000:
+        return value
+    return datetime.fromtimestamp(expiration_ns // 1_000_000_000, UTC).strftime("%Y-%m-%d")
+
+
+def _format_basket_id_for_execution_audit_log(basket_id: str) -> str:
+    parts = basket_id.split(":")
+    if len(parts) < 6 or "->" not in parts[5]:
+        return basket_id
+    near_expiration, far_expiration = parts[5].split("->", 1)
+    parts[5] = (
+        f"{_format_expiration_ns_for_execution_audit_log(near_expiration)}"
+        f"->{_format_expiration_ns_for_execution_audit_log(far_expiration)}"
+    )
+    return ":".join(parts)
+
+
+def _format_execution_audit_log_value(field: str, value: Any) -> str:
+    if value is None:
+        return "None"
+    if field == "basket_id":
+        return _format_basket_id_for_execution_audit_log(str(value))
+    places = _EXECUTION_AUDIT_DECIMAL_PLACES_BY_FIELD.get(field)
+    if places is None:
+        return str(value)
+    if isinstance(value, Decimal):
+        return _format_decimal_for_execution_audit_log(value, places)
+    try:
+        return _format_decimal_for_execution_audit_log(Decimal(str(value)), places)
+    except InvalidOperation:
+        return str(value)
+
 
 def _validate_l2_selection_caps(max_candidate_baskets: int, max_leg_subscriptions: int) -> None:
     if max_candidate_baskets < 0:
@@ -1100,7 +1173,7 @@ class SelectiveL2ExecutionAuditStrategy(DynamicCalendarSpreadStrategy):
         extra_field_text = ""
         if extra_fields:
             extra_field_text = " " + " ".join(
-                f"| {key}={value}"
+                f"| {key}={_format_execution_audit_log_value(key, value)}"
                 for key, value in sorted(extra_fields.items())
             )
         for leg, audit in build_l2_leg_audits_for_legs(
@@ -1136,25 +1209,25 @@ class SelectiveL2ExecutionAuditStrategy(DynamicCalendarSpreadStrategy):
             quote_age_ms = _quote_age_ms_for_leg(opportunity=opportunity, leg=leg, now_ns=now_ns)
             self.log.info(
                 "EXECUTION_AUDIT "
-                f"| basket_id={basket_id} "
+                f"| basket_id={_format_execution_audit_log_value('basket_id', basket_id)} "
                 f"| audit_source={audit_source} "
                 f"| role={leg.role} "
                 f"| instrument_id={leg.instrument_id} "
                 f"| side={leg.side.name} "
-                f"| requested_qty={audit.requested_qty} "
+                f"| requested_qty={_format_execution_audit_log_value('requested_qty', audit.requested_qty)} "
                 f"| status={audit.status.value} "
                 f"| selected_for_l2={selected_for_l2} "
-                f"| subscription_age_ms={subscription_age_ms} "
-                f"| last_request_age_ms={last_request_age_ms} "
-                f"| first_depth_latency_ms={first_depth_latency_ms} "
-                f"| last_depth_update_age_ms={last_depth_update_age_ms} "
+                f"| subscription_age_ms={_format_execution_audit_log_value('subscription_age_ms', subscription_age_ms)} "
+                f"| last_request_age_ms={_format_execution_audit_log_value('last_request_age_ms', last_request_age_ms)} "
+                f"| first_depth_latency_ms={_format_execution_audit_log_value('first_depth_latency_ms', first_depth_latency_ms)} "
+                f"| last_depth_update_age_ms={_format_execution_audit_log_value('last_depth_update_age_ms', last_depth_update_age_ms)} "
                 f"| depth_update_count={depth_update_count} "
-                f"| quote_age_ms={quote_age_ms} "
-                f"| executable_qty={audit.executable_qty} "
-                f"| vwap_price={audit.vwap_price} "
-                f"| worst_price={audit.worst_price} "
-                f"| notional={audit.notional} "
-                f"| book_age_ms={audit.book_age_ms} "
+                f"| quote_age_ms={_format_execution_audit_log_value('quote_age_ms', quote_age_ms)} "
+                f"| executable_qty={_format_execution_audit_log_value('executable_qty', audit.executable_qty)} "
+                f"| vwap_price={_format_execution_audit_log_value('vwap_price', audit.vwap_price)} "
+                f"| worst_price={_format_execution_audit_log_value('worst_price', audit.worst_price)} "
+                f"| notional={_format_execution_audit_log_value('notional', audit.notional)} "
+                f"| book_age_ms={_format_execution_audit_log_value('book_age_ms', audit.book_age_ms)} "
                 f"| depth_levels_seen={audit.depth_levels_seen}"
                 f"{extra_field_text}",
                 LogColor.CYAN,

@@ -38,6 +38,9 @@ from examples.live.okx.calendar_spread_research.strategies.phase1_v0_selective_l
     SelectiveL2ExecutionAuditStrategy,
 )
 from examples.live.okx.calendar_spread_research.strategies.phase1_v0_selective_l2_execution_audit import (
+    _format_execution_audit_log_value,
+)
+from examples.live.okx.calendar_spread_research.strategies.phase1_v0_selective_l2_execution_audit import (
     audit_leg_depth,
 )
 from examples.live.okx.calendar_spread_research.strategies.phase1_v0_selective_l2_execution_audit import (
@@ -212,6 +215,28 @@ def test_audit_leg_depth_reports_not_selected_before_missing_book():
     assert not_selected.status == DepthAuditStatus.NOT_SELECTED_FOR_L2
     assert not_selected.book_age_ms is None
     assert not_selected.depth_levels_seen == 0
+
+def test_execution_audit_log_formatter_trims_noisy_decimals_and_expiry_ns():
+    assert _format_execution_audit_log_value(
+        "basket_id",
+        "calendar:BTC:BTC:CALL:76000:1779868800000000000->1779955200000000000",
+    ) == "calendar:BTC:BTC:CALL:76000:2026-05-27->2026-05-28"
+    assert _format_execution_audit_log_value(
+        "near_dte_days",
+        Decimal("2.269698903958333333333333333"),
+    ) == "2.27"
+    assert _format_execution_audit_log_value(
+        "strike_moneyness",
+        "0.9870129870129870129870129870",
+    ) == "0.987"
+    assert _format_execution_audit_log_value(
+        "quote_age_ms",
+        Decimal("352705.698999"),
+    ) == "352705.699"
+    assert _format_execution_audit_log_value(
+        "fair_value_estimate",
+        Decimal("0.001750000"),
+    ) == "0.00175"
 
 
 def test_audit_leg_depth_returns_l2_executable_when_fresh_depth_suffices():
