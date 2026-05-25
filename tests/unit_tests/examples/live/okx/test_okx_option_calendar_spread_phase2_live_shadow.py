@@ -223,7 +223,7 @@ def test_phase2_fair_value_observation_missing_when_greeks_absent():
     assert phase2_fair_value_log_fields(None) == {"fair_value_context_status": "missing"}
 
 
-def test_phase2_shadow_build_node_components_forces_no_order_config():
+def test_phase2_shadow_build_node_components_preserves_explicit_sandbox_execution_config():
     args = SimpleNamespace(
         data_environment="live",
         underlyings="BTC,ETH",
@@ -282,7 +282,7 @@ def test_phase2_shadow_build_node_components_forces_no_order_config():
 
     _, strategy_config = build_node_components(args)
 
-    assert strategy_config.execution_enabled is False
-    assert strategy_config.dry_run is True
+    assert strategy_config.execution_enabled is True
+    assert strategy_config.dry_run is False
     assert strategy_config.posterior_windows_seconds == (60,)
     assert strategy_config.max_posterior_watches == 8

@@ -7,12 +7,14 @@
 #  you may not use this file except in compliance with the License.
 # -------------------------------------------------------------------------------------------------
 """
-Phase 2 live-shadow posterior collector for OKX option calendar spreads.
+Phase 2 posterior collector for OKX option calendar spreads.
 
-This version keeps Phase 2 in no-order mode. It reuses Phase 1 selective L2
-subscriptions, records candidate opening-side audits, and schedules close-side
-posterior probes at configured windows. The probes are data-only and produce
-``EXECUTION_AUDIT`` rows with ``audit_source=posterior_<window>``.
+This version reuses Phase 1 selective L2 subscriptions, records candidate
+opening-side audits, and schedules close-side posterior probes at configured
+windows. By default it remains data-only, but explicit
+``--enable-execution --no-dry-run`` routes selected candidate baskets to the
+Nautilus local sandbox execution client. OKX is still used only for live market
+data and instrument discovery; orders are not submitted to an OKX account.
 """
 
 from __future__ import annotations
@@ -86,6 +88,7 @@ except ModuleNotFoundError:  # pragma: no cover - supports direct script executi
     from phase1_v0_selective_l2_execution_audit import select_l2_subscription_ids
 from nautilus_trader.adapters.okx import OKX
 from nautilus_trader.adapters.okx import OKXLiveDataClientFactory
+from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import InstrumentId
@@ -112,8 +115,9 @@ class Phase2ShadowSignalResearchConfig(SelectiveL2ExecutionAuditConfig, frozen=T
     """
     Phase 2 v1 live-shadow extension.
 
-    The strategy intentionally remains no-order. Even if an inherited CLI flag
-    enables execution, the Phase 2 v1 strategy does not call submit-order paths.
+    The default mode is no-order. Explicit ``--enable-execution --no-dry-run``
+    keeps real OKX usage to market data and enables only Nautilus local sandbox
+    order submission.
     """
 
     posterior_windows_seconds: tuple[int, ...] = DEFAULT_POSTERIOR_WINDOWS_SECONDS
@@ -259,7 +263,7 @@ def phase2_fair_value_log_fields(observation: Phase2FairValueObservation | None)
 
 class Phase2ShadowSignalResearchStrategy(SelectiveL2ExecutionAuditStrategy):
     """
-    No-order Phase 2 live-shadow collector.
+    Phase 2 posterior collector with optional local sandbox execution.
 
     Candidate opportunities are watched after their opening-side audit. When a
     posterior window is due, the strategy builds close-side legs from current
@@ -287,6 +291,9 @@ class Phase2ShadowSignalResearchStrategy(SelectiveL2ExecutionAuditStrategy):
             emitted_basket_ids.add(basket_id)
             self._log_opportunity(opportunity)
             self._remember_posterior_watch(opportunity=opportunity, now_ns=now_ns)
+            if self.config.execution_enabled and not self.config.dry_run:
+                self._submit_open_orders(opportunity)
+                return emitted_basket_ids
         return emitted_basket_ids
 
     def _sync_l2_depth_subscriptions(
@@ -478,8 +485,6 @@ def build_node_components(
     strategy_values = phase1_strategy_config.dict()
     strategy_values.update(
         {
-            "execution_enabled": False,
-            "dry_run": True,
             "posterior_windows_seconds": tuple(args.posterior_windows_seconds),
             "max_posterior_watches": args.max_posterior_watches,
         },
@@ -496,12 +501,17 @@ def build_node(args: argparse.Namespace) -> TradingNode:
     node = TradingNode(config=config_node)
     node.trader.add_strategy(Phase2ShadowSignalResearchStrategy(strategy_config))
     node.add_data_client_factory(OKX, OKXLiveDataClientFactory)
+    if args.enable_execution and not args.dry_run:
+        node.add_exec_client_factory(OKX, SandboxLiveExecClientFactory)
     node.build()
     return node
 
 
 def main() -> None:
     args = parse_args()
+    if args.enable_execution and args.dry_run:
+        raise RuntimeError("Use --enable-execution together with --no-dry-run to submit sandbox orders")
+
     node = build_node(args)
     schedule_node_stop(args.run_seconds)
     try:
