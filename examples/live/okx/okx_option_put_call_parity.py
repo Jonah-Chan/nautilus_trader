@@ -422,6 +422,14 @@ def calculate_pcp_pricing(
         return None
     call_ts = int(getattr(call_quote, "ts_event", 0) or 0)
     put_ts = int(getattr(put_quote, "ts_event", 0) or 0)
+    if not _is_fresh_enough(now_ns, call_ts, stale_quote_ms):
+        return None
+    if not _is_fresh_enough(now_ns, put_ts, stale_quote_ms):
+        return None
+    if max(chain_ts, call_ts, put_ts, swap_ts) - min(chain_ts, call_ts, put_ts, swap_ts) > (
+        max_cross_source_skew_ms * 1_000_000
+    ):
+        return None
 
     call_prices = _quote_prices(call_quote)
     put_prices = _quote_prices(put_quote)
@@ -1931,7 +1939,6 @@ def _parse_time_in_force(raw: str) -> TimeInForce:
     except KeyError as exc:
         valid = ", ".join(member.name for member in TimeInForce)
         raise ValueError(f"Unsupported time_in_force: {raw}; expected one of {valid}") from exc
-
 
 def _streaming_config_from_args(args: argparse.Namespace) -> StreamingConfig | None:
     if not args.streaming_catalog_path:

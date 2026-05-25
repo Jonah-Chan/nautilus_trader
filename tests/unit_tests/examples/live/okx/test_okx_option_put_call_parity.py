@@ -410,6 +410,60 @@ def test_opportunity_fails_closed_for_missing_or_stale_cross_source_quotes():
         Decimal("0.001"),
     ) is None
 
+    stale_option_chain = FakeChain(
+        ts_event=now_ns,
+        calls={
+            pair.strike_price: _quote(
+                pair.call.instrument_id,
+                "0.1300",
+                "0.1400",
+                now_ns - 6_000_000_000,
+            ),
+        },
+        puts={
+            pair.strike_price: _quote(pair.put.instrument_id, "0.0300", "0.0400", now_ns),
+        },
+    )
+    assert evaluate_pcp_opportunity(
+        pair,
+        stale_option_chain,
+        swap_quote,
+        now_ns,
+        5_000,
+        1_000,
+        Decimal(1),
+        Decimal(1),
+        TimeInForce.IOC,
+        Decimal("0.001"),
+    ) is None
+
+    skewed_option_chain = FakeChain(
+        ts_event=now_ns,
+        calls={
+            pair.strike_price: _quote(
+                pair.call.instrument_id,
+                "0.1300",
+                "0.1400",
+                now_ns - 2_000_000_000,
+            ),
+        },
+        puts={
+            pair.strike_price: _quote(pair.put.instrument_id, "0.0300", "0.0400", now_ns),
+        },
+    )
+    assert evaluate_pcp_opportunity(
+        pair,
+        skewed_option_chain,
+        swap_quote,
+        now_ns,
+        5_000,
+        1_000,
+        Decimal(1),
+        Decimal(1),
+        TimeInForce.IOC,
+        Decimal("0.001"),
+    ) is None
+
     skewed_chain = FakeChain(
         ts_event=now_ns - 2_000_000_000,
         calls={
@@ -1004,7 +1058,6 @@ def test_node_components_default_to_gtc_for_sandbox_lifecycle_control():
     _, strategy_config = build_node_components(args)
 
     assert strategy_config.time_in_force == TimeInForce.GTC
-
 
 def test_node_components_configure_market_data_streaming():
     args = parse_args(
