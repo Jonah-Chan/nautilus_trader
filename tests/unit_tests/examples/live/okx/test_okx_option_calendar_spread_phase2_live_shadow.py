@@ -14,28 +14,28 @@ import pytest
 from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
     OrderLegPlan,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     Phase2ShadowSignalResearchConfig,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     Phase2ShadowSignalResearchStrategy,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     build_node_components,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     build_phase2_fair_value_observation,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     phase2_delta_bucket,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     phase2_fair_value_log_fields,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     posterior_window_label,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     validate_phase2_shadow_config,
 )
 from nautilus_trader.model.enums import OrderSide
@@ -94,6 +94,13 @@ def test_phase2_shadow_config_rejects_unsorted_or_empty_windows():
         validate_phase2_shadow_config(Phase2ShadowSignalResearchConfig(posterior_windows_seconds=()))
     with pytest.raises(ValueError, match="sorted and unique"):
         validate_phase2_shadow_config(Phase2ShadowSignalResearchConfig(posterior_windows_seconds=(300, 60)))
+    validate_phase2_shadow_config(
+        Phase2ShadowSignalResearchConfig(
+            execution_enabled=True,
+            dry_run=False,
+            posterior_windows_seconds=(60,),
+        ),
+    )
 
 
 def test_phase2_shadow_watch_keeps_l2_ids_and_evicts_oldest_when_capped():

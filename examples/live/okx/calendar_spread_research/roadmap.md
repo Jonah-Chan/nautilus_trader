@@ -7,7 +7,7 @@
 全局原则：
 
 - 真实 OKX 连接只用于行情和合约发现。
-- sandbox 执行只能作为受控证据层使用；当前不允许默认启用。显式 `--enable-execution --no-dry-run` 只接入 Nautilus 本地 sandbox，不向 OKX 账户下单。
+- sandbox 执行只能作为受控证据层使用；Phase 2 默认 no-order，显式 `--enable-execution --no-dry-run` 允许接入 Nautilus 本地 sandbox 做测试，不向 OKX 账户下单。
 - 真实账户执行始终不在本研究轨道内。
 - 每个 Phase 只能由 artifact 和 gate 结论推进，不能因为路线想完成而跳级。
 - Markdown 文档和后续生成的阶段报告使用中文叙述；代码标识、artifact 路径和 JSON 字段名保持原样。
@@ -139,7 +139,7 @@ Phase 3 entry gate：
 - 主线 closeout：`../../../../.omx/artifacts/dynamic-calendar-pnl/phase2_research_closeout_no_promotion_v0_20260524T131500Z.{json,md}`。汇总 5 个注册模型的 replay/overlap 证据和淘汰原因；结论为 `phase2_research_complete=true`、`phase2_promotion_proven=false`、`phase3_entry_allowed=false`。
 - 更新后 registry：`../../../../.omx/artifacts/dynamic-calendar-pnl/phase2_research_registry_v0_20260524T131600Z.{json,md}`。将 closeout 写回统一 ledger，Phase 2 主线模型研究已完成为 no-promotion，Phase 3 gate 仍为 blocked。
 
-当前下一步：Phase 2 主线已 close out 为 no-promotion。若继续 Phase 2，只能先定义新的交易机会假设或外部特征；不要把 catalog replay 设施优化当作当前主线。posterior coverage 缺口已经被专用 artifact 证明为 Phase 3 entry gate 失败项；显式请求的 Phase 2 sandbox execution 只能作为本地 sandbox 生命周期/审计补证，不代表 Phase 3 entry gate 已通过。只有 Phase 3 entry gate 用 artifact 证明通过后，才允许提出或进入 Phase 3。
+当前下一步：Phase 2 主线已 close out 为 no-promotion。若继续 Phase 2，只能先定义新的交易机会假设或外部特征；不要把 catalog replay 设施优化当作当前主线。posterior coverage 缺口已经被专用 artifact 证明为 Phase 3 entry gate 失败项；Phase 2 sandbox execution 只能作为 Nautilus 本地 sandbox 受控测试，不代表 Phase 3 entry gate 已通过。只有 Phase 3 entry gate 用 artifact 证明通过后，才允许提出或进入 Phase 3。
 
 ## Phase 3: execution planner and residual-risk handling
 

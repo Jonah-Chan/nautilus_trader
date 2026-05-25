@@ -10,7 +10,7 @@ Phase 0 策略代码已经冻结为 `strategies/phase0_v0_flow_validation.py`：
 
 - 允许连接 OKX live 读取行情和发现合约。
 - 研究主线禁止真实账户下单。
-- 当前 Phase 2 状态禁止默认进入 sandbox execution；显式 `--enable-execution --no-dry-run` 只允许接入 Nautilus 本地 sandbox，不向 OKX 账户下单。
+- 当前 Phase 2 默认 no-order；显式 `--enable-execution --no-dry-run` 允许接入 Nautilus 本地 sandbox 做受控执行测试，OKX 只用于 live 行情和合约发现，不向 OKX 账户下单。
 - 任何 Phase 3/4/5 执行、风控、准生产路径都必须先有 artifact-backed Phase 3 entry gate 通过证明。
 - 当前执行边界仍是 `execution_enabled=false`、`sandbox_execution=false`、`real_orders=false`、`sandbox_fill_rows=0`。
 
@@ -27,12 +27,12 @@ Phase 0 策略代码已经冻结为 `strategies/phase0_v0_flow_validation.py`：
 | --- | --- | --- |
 | Phase 0 | `strategies/phase0_v0_flow_validation.py` | 已接受为 flow-validation harness，冻结盈利逻辑 |
 | Phase 1 | `strategies/phase1_v0_selective_l2_execution_audit.py` | data-only execution audit 已推进；当前仍不是 sandbox-execution ready |
-| Phase 2 | `strategies/phase2_v0_shadow_signal_research.py`、`strategies/phase2_v1_shadow_signal_research.py` | 已从 baseline signal gate 调整为交易机会模型研究；v1 默认 no-order，但显式执行开关可走 Nautilus 本地 sandbox；research-complete 已 close out 为 no-promotion，Phase 3 entry gate 仍失败 |
+| Phase 2 | `strategies/phase2_v0_shadow_signal_research.py`、`strategies/phase2_v1_live_shadow_posterior_collector.py` | 已从 baseline signal gate 调整为交易机会模型研究；v1 是 live-shadow/posterior collector，默认 no-order，显式允许 Nautilus 本地 sandbox 测试；research-complete 已 close out 为 no-promotion，Phase 3 entry gate 仍失败 |
 | Phase 3 | `strategies/phase3_v0_execution_planner.py` | 未进入，被 Phase 2 gate 阻止 |
 | Phase 4 | `strategies/phase4_v0_risk_recovery.py` | 未进入，被 Phase 2 gate 阻止 |
 | Phase 5 | `strategies/phase5_v0_staged_near_production.py` | 未进入，被 Phase 2 gate 阻止 |
 
-每个 Phase 至少一个、最多两个策略版本。如果某个 Phase 需要第三个策略模块，说明边界过大，应该拆分或进入下一阶段，而不是继续隐藏扩张。
+每个 Phase 至少一个、最多五个策略版本。每个版本策略文件名必须包含该版本最显著的特点，便于区分，例如 `phase2_v1_live_shadow_posterior_collector.py`。
 
 ## 当前路线状态
 
@@ -83,4 +83,4 @@ Phase 2 已起步并完成多轮 no-order shadow 证据：
 4. 若继续 Phase 2，只能先定义新的交易机会假设或外部特征，不应把 catalog replay 设施优化当作当前主线。
 5. posterior coverage 只在离线实验产生非脆弱正候选后再进入新的 no-order live shadow；当前 gap artifact 只证明阻塞, 不证明值得长跑。
 
-不要直接写 Phase 3 execution planner。不要真实订单、不要默认 sandbox execution；如显式请求 Phase 2 sandbox execution，只能使用 Nautilus 本地 sandbox 并保留 gate override 证据。
+不要直接写 Phase 3 execution planner。不要真实订单；Phase 2 sandbox execution 只允许通过显式 `--enable-execution --no-dry-run` 接入 Nautilus 本地 sandbox 作为受控测试，不代表 Phase 3 entry gate 已通过。

@@ -38,10 +38,10 @@ sys.path.insert(0, str(REPO_ROOT))
 from examples.live.okx.calendar_spread_research.strategies.phase0_v0_flow_validation import (
     CalendarOpportunity,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     Phase2ShadowSignalResearchConfig,
 )
-from examples.live.okx.calendar_spread_research.strategies.phase2_v1_shadow_signal_research import (
+from examples.live.okx.calendar_spread_research.strategies.phase2_v1_live_shadow_posterior_collector import (
     Phase2ShadowSignalResearchStrategy,
 )
 from examples.live.okx.okx_option_core import normalize_option_instrument

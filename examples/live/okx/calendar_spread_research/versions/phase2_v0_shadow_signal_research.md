@@ -7,7 +7,7 @@
 ## 策略代码
 
 - 主模块：`../strategies/phase2_v0_shadow_signal_research.py`。
-- live-shadow posterior collector：`../strategies/phase2_v1_shadow_signal_research.py`。
+- live-shadow posterior collector：`../strategies/phase2_v1_live_shadow_posterior_collector.py`。
 - 不得把盈利逻辑写回 Phase 0 或 Phase 1 模块。
 
 ## 设计
@@ -30,7 +30,7 @@
 - 第一阶段 input artifact：`../../../../.omx/artifacts/dynamic-calendar-pnl/phase2_shadow_inputs_from_complete_baskets_20260524T021125Z.json`，590 events，227 shadow inputs，363 blocked，79 fresh candidate，148 delayed-depth warning。
 - strict fair-value fixture：`phase2_shadow_inputs_fixture_fair_value_20260524T021125Z.json` 只证明 CLI/schema path，不是研究信号。
 - posterior skeleton / gap audit 已证明当前历史数据缺 close-side executable exit values，不是 schema 问题。
-- `strategies/phase2_v1_shadow_signal_research.py` 已能 no-order 收集 close-side `posterior_<window>` audit row，并在 Greeks 可用时写入 `l1_mid_calendar_proxy_not_edge_model` fair-value context。该 proxy 只能作为诊断上下文。
+- `strategies/phase2_v1_live_shadow_posterior_collector.py` 是 Phase 2 live-shadow/posterior collector，已能收集 close-side `posterior_<window>` audit row，并在 Greeks 可用时写入 `l1_mid_calendar_proxy_not_edge_model` fair-value context。该 proxy 只能作为诊断上下文；该策略默认 no-order，但显式 `--enable-execution --no-dry-run` 允许 Nautilus 本地 sandbox execution 测试。
 
 最新 no-order evidence：
 
@@ -117,6 +117,6 @@ L2 policy/signal overlap：
 
 ## 门槛
 
-- Research-complete 门槛：registry、ledger、模型 replay/comparison 和 catalog replay feasibility 边界必须可复核。
+- Research-complete 门槛：registry、ledger、模型 replay/comparison、L2 policy/signal overlap 和 no-promotion closeout 必须可复核。
 - Phase 3 entry 门槛：positive buckets 必须在成本扣除后仍为正；negative samples / false positives 必须被理解；不能依赖 mid-only 或 mark-only profit；bucket 经过 Phase 1 executable-price 和 transport-quality filter 后仍必须为正。
-- 当前状态：Phase 2 research-complete 仍在推进，Phase 3 被阻止。唯一非代理 fair-value 正样本已被 robustness 审计判定为 fragile，30m/1h posterior coverage 也由 gap artifact 证明全缺失，不构成 promotion 证据。
+- 当前状态：Phase 2 research-complete 已 close out 为 no-promotion，Phase 3 被阻止。唯一非代理 fair-value 正样本已被 robustness 审计判定为 fragile，30m/1h posterior coverage 也由 gap artifact 证明全缺失，不构成 promotion 证据。
