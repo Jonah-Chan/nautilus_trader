@@ -29,8 +29,9 @@ use nautilus_common::{
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
-        Bar, Data, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
+        Bar, CustomData, Data, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
+        MarkPriceUpdate, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
+        close::InstrumentClose, try_extract_from_py,
     },
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
@@ -131,7 +132,7 @@ impl PyStreamingFeatherWriter {
         let storage_options = fs_storage_options
             .map(|map| map.into_iter().collect::<ahash::AHashMap<String, String>>());
 
-        let (object_store, _base_path, _original_uri) =
+        let (object_store, base_path, _original_uri) =
             create_object_store_from_path(&full_path, storage_options)
                 .map_err(|e| PyIOError::new_err(format!("Failed to create object store: {e}")))?;
 
@@ -211,7 +212,7 @@ impl PyStreamingFeatherWriter {
 
         // Create FeatherWriter
         let writer = FeatherWriter::new(
-            path,
+            base_path,
             object_store,
             clock_rc,
             rotation_config,
@@ -312,6 +313,42 @@ impl PyStreamingFeatherWriter {
             return runtime
                 .block_on(async { writer.write_data(Data::Depth10(Box::new(depth))).await })
                 .map_err(|e| PyIOError::new_err(format!("Failed to write OrderBookDepth10: {e}")));
+        }
+
+        if let Ok(custom) = data.extract::<CustomData>(py) {
+            let mut writer = self.writer.borrow_mut();
+            let runtime = get_runtime();
+            return runtime
+                .block_on(async { writer.write_data(Data::Custom(custom)).await })
+                .map_err(|e| PyIOError::new_err(format!("Failed to write CustomData: {e}")));
+        }
+
+        let data_ref = data.bind(py);
+        let type_name = data_ref
+            .get_type()
+            .getattr("__name__")
+            .and_then(|name| name.extract::<String>());
+        if let Ok(type_name) = type_name
+            && let Some(custom_data) = try_extract_from_py(&type_name, data_ref)
+        {
+            let identifier = data_ref
+                .getattr("instrument_id")
+                .ok()
+                .and_then(|instrument_id| {
+                    instrument_id
+                        .str()
+                        .ok()
+                        .map(|value| value.to_string_lossy().into_owned())
+                });
+            let data_type = DataType::new(&type_name, None, identifier);
+            let custom = CustomData::new(custom_data, data_type);
+            let mut writer = self.writer.borrow_mut();
+            let runtime = get_runtime();
+            return runtime
+                .block_on(async { writer.write_data(Data::Custom(custom)).await })
+                .map_err(|e| {
+                    PyIOError::new_err(format!("Failed to write custom data {type_name}: {e}"))
+                });
         }
 
         if let Ok(price) = data.extract::<IndexPriceUpdate>(py) {

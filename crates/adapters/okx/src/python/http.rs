@@ -135,6 +135,19 @@ impl OKXHttpClient {
         environment: OKXEnvironment,
         proxy_url: Option<String>,
     ) -> PyResult<Self> {
+        if api_key.is_none() && api_secret.is_none() && api_passphrase.is_none() {
+            return Self::new(
+                base_url,
+                timeout_secs,
+                max_retries,
+                retry_delay_ms,
+                retry_delay_max_ms,
+                environment,
+                proxy_url,
+            )
+            .map_err(to_pyvalue_err);
+        }
+
         Self::with_credentials(
             api_key,
             api_secret,

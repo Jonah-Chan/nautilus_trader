@@ -26,6 +26,7 @@ default = []
 arrow = [
   "nautilus-deribit/arrow",
   "nautilus-hyperliquid/arrow",
+  "nautilus-okx/arrow",
   "nautilus-serialization/arrow",
 ]
 cython-compat = []

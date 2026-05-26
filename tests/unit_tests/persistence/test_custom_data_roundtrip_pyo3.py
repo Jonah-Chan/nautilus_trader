@@ -59,7 +59,7 @@ def test_python_custom_data_roundtrip(tmp_path):
         RustTestCustomData(instrument_id, 4.56, False, 2, 2),
     ]
     wrapped = [CustomData(data_type, item) for item in original_data]
-    assert [custom_data_backend_kind(item) for item in wrapped] == ["native", "native"]
+    assert all(custom_data_backend_kind(item) == "native" for item in wrapped)
 
     print(f"Writing {len(wrapped)} items...")
 
@@ -135,6 +135,259 @@ def test_python_custom_data_roundtrip(tmp_path):
     assert "data_type" in raw
     assert "payload" in raw
     assert raw["payload"].get("value") == 1.23
+
+
+def test_okx_venue_option_greeks_roundtrip(tmp_path):
+    """Test OKX venue option greeks roundtrip via native Rust custom data."""
+    from nautilus_trader.core.nautilus_pyo3 import InstrumentId
+    from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalog
+    from nautilus_trader.core.nautilus_pyo3.model import CustomData
+    from nautilus_trader.core.nautilus_pyo3.model import DataType
+    from nautilus_trader.core.nautilus_pyo3.model import custom_data_backend_kind
+    from nautilus_trader.core.nautilus_pyo3.model import register_custom_data_class
+    from nautilus_trader.core.nautilus_pyo3.okx import VenueOptionGreeks
+
+    register_custom_data_class(VenueOptionGreeks)
+    catalog_path = tmp_path / "catalog_file"
+    catalog_path.mkdir(parents=True, exist_ok=True)
+    pyo3_catalog = ParquetDataCatalog(str(catalog_path))
+
+    instrument_id = InstrumentId.from_str("BTC-USD-240329-70000-C.OKX")
+    metadata = {"venue": "OKX", "instrument_id": str(instrument_id)}
+    data_type = DataType("VenueOptionGreeks", metadata, str(instrument_id))
+    original_data = [
+        VenueOptionGreeks(
+            instrument_id,
+            i + 0.55,
+            i + 0.02,
+            i + 0.15,
+            -(i + 0.05),
+            i + 0.01,
+            i + 0.25,
+            i + 0.24,
+            i + 0.26,
+            70_500.0 + i,
+            1_000.0 + i,
+            "BLACK_SCHOLES" if i % 2 == 0 else "PRICE_ADJUSTED",
+            i * 2 + 1,
+            i * 2 + 2,
+        )
+        for i in range(10_000)
+    ]
+    wrapped = [CustomData(data_type, item) for item in original_data]
+    assert all(custom_data_backend_kind(item) == "native" for item in wrapped)
+    standard_greeks = original_data[0].to_option_greeks()
+    assert standard_greeks.instrument_id == instrument_id
+    assert standard_greeks.delta == 0.55
+    assert standard_greeks.mark_iv == 0.25
+
+    pyo3_catalog.write_custom_data(wrapped)
+    result = pyo3_catalog.query(
+        "VenueOptionGreeks",
+        [str(instrument_id)],
+        None,
+        None,
+        None,
+        None,
+        True,
+    )
+
+    roundtripped = [item.data for item in result]
+    assert len(roundtripped) == 10_000
+    for expected, actual in zip(original_data, roundtripped, strict=True):
+        assert isinstance(actual, VenueOptionGreeks)
+        assert actual.instrument_id == expected.instrument_id
+        assert actual.delta == expected.delta
+        assert actual.gamma == expected.gamma
+        assert actual.vega == expected.vega
+        assert actual.theta == expected.theta
+        assert actual.rho == expected.rho
+        assert actual.mark_iv == expected.mark_iv
+        assert actual.bid_iv == expected.bid_iv
+        assert actual.ask_iv == expected.ask_iv
+        assert actual.underlying_price == expected.underlying_price
+        assert actual.open_interest == expected.open_interest
+        assert actual.convention == expected.convention
+        assert actual.ts_event == expected.ts_event
+        assert actual.ts_init == expected.ts_init
+
+    for item in result:
+        assert isinstance(item, CustomData)
+        assert custom_data_backend_kind(item) == "native"
+        assert item.data_type.type_name == "VenueOptionGreeks"
+        assert item.data_type.metadata == metadata
+        assert item.data_type.identifier == str(instrument_id)
+
+    def assert_greeks(orig, rt):
+        assert orig.instrument_id == rt.instrument_id
+        assert orig.delta == rt.delta
+        assert orig.convention == rt.convention
+        assert orig.ts_event == rt.ts_event
+        assert orig.ts_init == rt.ts_init
+
+    _assert_custom_data_json_roundtrip(result[:10], VenueOptionGreeks, assert_greeks)
+
+
+def test_okx_venue_option_greeks_streaming_writer_to_catalog(tmp_path):
+    """Test OKX venue option greeks CustomData through streaming Feather conversion."""
+    from nautilus_trader.core.nautilus_pyo3 import InstrumentId
+    from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalog
+    from nautilus_trader.core.nautilus_pyo3 import StreamingFeatherWriter
+    from nautilus_trader.core.nautilus_pyo3.common import Cache
+    from nautilus_trader.core.nautilus_pyo3.common import Clock
+    from nautilus_trader.core.nautilus_pyo3.model import CustomData
+    from nautilus_trader.core.nautilus_pyo3.model import DataType
+    from nautilus_trader.core.nautilus_pyo3.model import custom_data_backend_kind
+    from nautilus_trader.core.nautilus_pyo3.model import register_custom_data_class
+    from nautilus_trader.core.nautilus_pyo3.okx import VenueOptionGreeks
+
+    register_custom_data_class(VenueOptionGreeks)
+    catalog_path = tmp_path / "catalog_stream"
+    catalog_path.mkdir(parents=True, exist_ok=True)
+    pyo3_catalog = ParquetDataCatalog(str(catalog_path))
+
+    instance_id = "okx-greeks-live"
+    instrument_id = InstrumentId.from_str("BTC-USD-240329-70000-C.OKX")
+    metadata = {"venue": "OKX", "instrument_id": str(instrument_id)}
+    data_type = DataType("VenueOptionGreeks", metadata, str(instrument_id))
+    greeks = VenueOptionGreeks(
+        instrument_id,
+        0.55,
+        0.02,
+        0.15,
+        -0.05,
+        0.01,
+        0.25,
+        0.24,
+        0.26,
+        70500.0,
+        1000.0,
+        "BLACK_SCHOLES",
+        1,
+        2,
+    )
+    wrapped = CustomData(data_type, greeks)
+    assert custom_data_backend_kind(wrapped) == "native"
+
+    stream_path = catalog_path / "live" / instance_id
+    stream_path.mkdir(parents=True, exist_ok=True)
+    writer = StreamingFeatherWriter(
+        path=str(stream_path),
+        cache=Cache(),
+        clock=Clock.new_test(),
+        include_types=["custom/VenueOptionGreeks"],
+    )
+    writer.write(wrapped)
+    writer.close()
+
+    pyo3_catalog.convert_stream_to_data(
+        instance_id,
+        "custom/VenueOptionGreeks",
+        subdirectory="live",
+        identifiers=[str(instrument_id)],
+    )
+    result = pyo3_catalog.query(
+        "VenueOptionGreeks",
+        [str(instrument_id)],
+        None,
+        None,
+        None,
+        None,
+        True,
+    )
+
+    assert len(result) == 1
+    assert isinstance(result[0], CustomData)
+    assert custom_data_backend_kind(result[0]) == "native"
+    assert result[0].data_type.type_name == "VenueOptionGreeks"
+    assert result[0].data_type.metadata == metadata
+    assert result[0].data_type.identifier == str(instrument_id)
+    actual = result[0].data
+    assert isinstance(actual, VenueOptionGreeks)
+    assert actual.instrument_id == instrument_id
+    assert actual.delta == 0.55
+    assert actual.gamma == 0.02
+    assert actual.convention == "BLACK_SCHOLES"
+    assert actual.ts_event == 1
+    assert actual.ts_init == 2
+
+
+def test_okx_venue_option_greeks_direct_streaming_writer_to_catalog(tmp_path):
+    """Test OKX venue option greeks direct custom payload through streaming Feather conversion."""
+    from nautilus_trader.core.nautilus_pyo3 import InstrumentId
+    from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalog
+    from nautilus_trader.core.nautilus_pyo3 import StreamingFeatherWriter
+    from nautilus_trader.core.nautilus_pyo3.common import Cache
+    from nautilus_trader.core.nautilus_pyo3.common import Clock
+    from nautilus_trader.core.nautilus_pyo3.model import CustomData
+    from nautilus_trader.core.nautilus_pyo3.model import custom_data_backend_kind
+    from nautilus_trader.core.nautilus_pyo3.model import register_custom_data_class
+    from nautilus_trader.core.nautilus_pyo3.okx import VenueOptionGreeks
+
+    register_custom_data_class(VenueOptionGreeks)
+    catalog_path = tmp_path / "catalog_stream_direct"
+    catalog_path.mkdir(parents=True, exist_ok=True)
+    pyo3_catalog = ParquetDataCatalog(str(catalog_path))
+
+    instance_id = "okx-greeks-live-direct"
+    instrument_id = InstrumentId.from_str("BTC-USD-240329-70000-C.OKX")
+    greeks = VenueOptionGreeks(
+        instrument_id,
+        0.55,
+        0.02,
+        0.15,
+        -0.05,
+        0.01,
+        0.25,
+        0.24,
+        0.26,
+        70500.0,
+        1000.0,
+        "BLACK_SCHOLES",
+        1,
+        2,
+    )
+
+    stream_path = catalog_path / "live" / instance_id
+    stream_path.mkdir(parents=True, exist_ok=True)
+    writer = StreamingFeatherWriter(
+        path=str(stream_path),
+        cache=Cache(),
+        clock=Clock.new_test(),
+        include_types=["custom/VenueOptionGreeks"],
+    )
+    writer.write(greeks)
+    writer.close()
+
+    pyo3_catalog.convert_stream_to_data(
+        instance_id,
+        "custom/VenueOptionGreeks",
+        subdirectory="live",
+        identifiers=[str(instrument_id)],
+    )
+    result = pyo3_catalog.query(
+        "VenueOptionGreeks",
+        [str(instrument_id)],
+        None,
+        None,
+        None,
+        None,
+        True,
+    )
+
+    assert len(result) == 1
+    assert isinstance(result[0], CustomData)
+    assert custom_data_backend_kind(result[0]) == "native"
+    assert result[0].data_type.type_name == "VenueOptionGreeks"
+    assert result[0].data_type.identifier == str(instrument_id)
+    actual = result[0].data
+    assert isinstance(actual, VenueOptionGreeks)
+    assert actual.instrument_id == instrument_id
+    assert actual.delta == 0.55
+    assert actual.gamma == 0.02
+    assert actual.convention == "BLACK_SCHOLES"
+    assert actual.ts_event == 1
+    assert actual.ts_init == 2
 
 
 def test_macro_yield_curve_data_roundtrip(tmp_path):

@@ -32,12 +32,14 @@ use std::str::FromStr;
 
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
+use nautilus_model::data::ensure_rust_extractor_registered;
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::{prelude::*, types::PyDict};
 
 use crate::{
     common::{consts::OKX, enums::OKXTriggerType},
     config::{OKXDataClientConfig, OKXExecClientConfig},
+    data_types::{VenueOptionGreeks, register_okx_custom_data},
     factories::{OKXDataClientFactory, OKXExecutionClientFactory},
 };
 
@@ -130,6 +132,7 @@ pub fn okx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::common::enums::OKXVipLevel>()?;
     m.add_class::<crate::common::enums::OKXEnvironment>()?;
     m.add_class::<crate::common::urls::OKXEndpointType>()?;
+    m.add_class::<VenueOptionGreeks>()?;
     m.add_class::<OKXDataClientConfig>()?;
     m.add_class::<OKXExecClientConfig>()?;
     m.add_class::<OKXDataClientFactory>()?;
@@ -172,6 +175,9 @@ pub fn okx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
             "Failed to register OKX exec config extractor: {e}"
         )));
     }
+
+    register_okx_custom_data();
+    let _result = ensure_rust_extractor_registered::<VenueOptionGreeks>();
 
     Ok(())
 }

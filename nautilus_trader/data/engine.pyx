@@ -2843,7 +2843,13 @@ cdef class DataEngine(Component):
     cpdef void _handle_custom_data(self, CustomData data, bint historical = False):
         cdef InstrumentId instrument_id = getattr(data.data, "instrument_id", None)
         cdef str topic = self._topic_cache.get_custom_data_topic(data.data_type, instrument_id, historical)
+        self._msgbus.add_streaming_type(type(data.data))
         self._msgbus.publish_c(topic=topic, msg=data.data)
+
+        if hasattr(data.data, "to_option_greeks"):
+            option_greeks = data.data.to_option_greeks()
+            if option_greeks is not None:
+                self._handle_option_greeks(option_greeks)
 
 # -- OPTION CHAIN FEED METHODS -------------------------------------------------------------------
 

@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::collections::HashMap;
 #[cfg(feature = "python")]
 use std::collections::HashSet;
 #[cfg(feature = "python")]
@@ -26,8 +27,38 @@ use serde::{Serialize, Serializer};
 
 use crate::data::{
     Data, DataType, HasTsInit,
+    option_chain::OptionGreeks,
     registry::{ensure_json_deserializer_registered, register_json_deserializer},
 };
+
+type OptionGreeksBridge = fn(&dyn CustomDataTrait) -> Option<OptionGreeks>;
+
+fn option_greeks_bridges() -> &'static std::sync::RwLock<HashMap<&'static str, OptionGreeksBridge>>
+{
+    static BRIDGES: std::sync::OnceLock<
+        std::sync::RwLock<HashMap<&'static str, OptionGreeksBridge>>,
+    > = std::sync::OnceLock::new();
+    BRIDGES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Registers a custom-data bridge into standard [`OptionGreeks`].
+pub fn register_option_greeks_bridge(
+    type_name: &'static str,
+    bridge: OptionGreeksBridge,
+) -> anyhow::Result<()> {
+    let mut bridges = option_greeks_bridges()
+        .write()
+        .map_err(|_| anyhow::anyhow!("option greeks bridge registry poisoned"))?;
+    bridges.insert(type_name, bridge);
+    Ok(())
+}
+
+/// Converts a custom payload into standard [`OptionGreeks`] if a bridge is registered.
+pub fn custom_data_to_option_greeks(data: &dyn CustomDataTrait) -> Option<OptionGreeks> {
+    let bridges = option_greeks_bridges().read().ok()?;
+    let bridge = bridges.get(data.type_name())?;
+    bridge(data)
+}
 
 #[cfg(feature = "python")]
 fn intern_type_name_static(name: String) -> &'static str {
@@ -305,6 +336,12 @@ pub trait CustomDataTrait: HasTsInit + Send + Sync + Debug {
     /// Returns an error if JSON serialization fails.
     fn to_json_py(&self) -> anyhow::Result<String> {
         self.to_json()
+    }
+
+    /// Converts this custom payload into standard option greeks when it is a venue-specific
+    /// greeks envelope.
+    fn to_option_greeks(&self) -> Option<OptionGreeks> {
+        None
     }
 
     /// Returns a cloned Arc of the custom data.

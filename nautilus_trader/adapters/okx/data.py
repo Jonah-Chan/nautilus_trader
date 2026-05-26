@@ -30,6 +30,7 @@ from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.secure import mask_api_key
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
+from nautilus_trader.core.data import Data
 from nautilus_trader.core.datetime import ensure_pydatetime_utc
 from nautilus_trader.core.nautilus_pyo3 import GreeksConvention
 from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
@@ -67,7 +68,9 @@ from nautilus_trader.data.messages import UnsubscribeTradeTicks
 from nautilus_trader.live.cancellation import DEFAULT_FUTURE_CANCELLATION_TIMEOUT
 from nautilus_trader.live.cancellation import cancel_tasks_with_timeout
 from nautilus_trader.live.data_client import LiveMarketDataClient
+from nautilus_trader.model.custom import customdataclass
 from nautilus_trader.model.data import Bar
+from nautilus_trader.model.data import CustomData
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.data import InstrumentStatus
@@ -75,12 +78,70 @@ from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.data import capsule_to_data
+from nautilus_trader.model.data import pyo3_list_to_data_list
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import book_type_to_str
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.instruments import Instrument
+
+
+@customdataclass
+class VenueOptionGreeks(Data):
+    instrument_id: InstrumentId
+    delta: float
+    gamma: float
+    vega: float
+    theta: float
+    rho: float
+    mark_iv: float = 0.0
+    bid_iv: float = 0.0
+    ask_iv: float = 0.0
+    underlying_price: float = 0.0
+    open_interest: float = 0.0
+    convention: str = "BLACK_SCHOLES"
+
+    def to_option_greeks(self) -> OptionGreeks:
+        return OptionGreeks(
+            instrument_id=self.instrument_id,
+            delta=self.delta,
+            gamma=self.gamma,
+            vega=self.vega,
+            theta=self.theta,
+            rho=self.rho,
+            mark_iv=self.mark_iv,
+            bid_iv=self.bid_iv,
+            ask_iv=self.ask_iv,
+            underlying_price=self.underlying_price,
+            open_interest=self.open_interest,
+            ts_event=self.ts_event,
+            ts_init=self.ts_init,
+        )
+
+
+def _custom_data_from_pyo3(msg: Any) -> CustomData:
+    inner = msg.data
+    if type(inner).__name__ != "VenueOptionGreeks":
+        return pyo3_list_to_data_list([msg])[0]
+
+    venue_greeks = VenueOptionGreeks(
+        ts_event=inner.ts_event,
+        ts_init=inner.ts_init,
+        instrument_id=InstrumentId.from_str(str(inner.instrument_id)),
+        delta=inner.delta,
+        gamma=inner.gamma,
+        vega=inner.vega,
+        theta=inner.theta,
+        rho=inner.rho,
+        mark_iv=inner.mark_iv,
+        bid_iv=inner.bid_iv,
+        ask_iv=inner.ask_iv,
+        underlying_price=inner.underlying_price,
+        open_interest=inner.open_interest,
+        convention=inner.convention,
+    )
+    return CustomData(DataType(VenueOptionGreeks), venue_greeks)
 
 
 class OKXDataClient(LiveMarketDataClient):
@@ -786,9 +847,13 @@ class OKXDataClient(LiveMarketDataClient):
             elif isinstance(msg, nautilus_pyo3.InstrumentStatus):
                 self._handle_data(InstrumentStatus.from_pyo3(msg))
             elif isinstance(msg, nautilus_pyo3.OptionGreeks):
+                # Compatibility fallback for older pyo3 websocket builds; current OKX greeks
+                # arrive as CustomData so the venue payload can be recorded and replayed.
                 greeks = OptionGreeks.from_pyo3(msg)
                 if greeks.instrument_id in self._option_greeks_instrument_ids:
                     self._handle_data(greeks)
+            elif isinstance(msg, nautilus_pyo3.CustomData):
+                self._handle_data(_custom_data_from_pyo3(msg))
             else:
                 self._log.error(f"Cannot handle message {msg}, not implemented")
         except Exception as e:

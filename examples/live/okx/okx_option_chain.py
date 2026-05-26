@@ -54,6 +54,7 @@ except ModuleNotFoundError:  # pragma: no cover - supports direct script executi
 from nautilus_trader.adapters.okx import OKX
 from nautilus_trader.adapters.okx import OKXDataClientConfig
 from nautilus_trader.adapters.okx import OKXLiveDataClientFactory
+from nautilus_trader.adapters.okx.data import VenueOptionGreeks
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.config import ActorConfig
 from nautilus_trader.config import InstrumentProviderConfig
@@ -340,6 +341,7 @@ class OKXOptionChainTester(Actor):
         self._subscribed_series: list[nautilus_pyo3.OptionSeriesId] = []
         self._latest_chain_slices: dict[str, Any] = {}
         self._latest_underlying_quotes: dict[str, QuoteTick] = {}
+        self._polars_missing_logged = False
 
     def on_start(self) -> None:
         # OKX instrument provider 会在 Actor 启动前加载合约定义。对这个简单示例,
@@ -422,7 +424,13 @@ class OKXOptionChainTester(Actor):
         series_key = str(chain_slice.series_id)
         self._latest_chain_slices[series_key] = chain_slice
 
-        pl = import_module("polars")
+        try:
+            pl = import_module("polars")
+        except ModuleNotFoundError:
+            if not self._polars_missing_logged:
+                self.log.warning("polars is not installed; skipping option-chain table rendering")
+                self._polars_missing_logged = True
+            return
 
         for latest_slice in sorted(
             self._latest_chain_slices.values(),
@@ -512,7 +520,7 @@ def _streaming_config_from_args(args: argparse.Namespace) -> StreamingConfig | N
         catalog_path=args.streaming_catalog_path,
         fs_protocol="file",
         flush_interval_ms=args.streaming_flush_interval_ms,
-        include_types=[QuoteTick, OptionGreeks, CryptoOption, CryptoPerpetual],
+        include_types=[QuoteTick, OptionGreeks, VenueOptionGreeks, CryptoOption, CryptoPerpetual],
         replace_existing=args.streaming_replace_existing,
     )
 

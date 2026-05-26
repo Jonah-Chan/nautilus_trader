@@ -85,6 +85,7 @@ use crate::{
             parse_millisecond_timestamp, parse_position_status_report, parse_price, parse_quantity,
         },
     },
+    data_types::VenueOptionGreeks,
     http::models::{OKXAccount, OKXPosition},
     websocket::{
         OKXWebSocketClient,
@@ -1698,13 +1699,15 @@ fn handle_channel_data(
                             ts_init,
                         ) {
                             Ok(greeks) => {
-                                Python::attach(|py| match greeks.into_py_any(py) {
+                                let custom = VenueOptionGreeks::from_option_greeks(&greeks)
+                                    .into_custom_data();
+                                Python::attach(|py| match custom.into_py_any(py) {
                                     Ok(py_obj) => {
                                         call_python_threadsafe(py, call_soon, callback, py_obj);
                                     }
                                     Err(e) => {
                                         log::error!(
-                                            "Failed to convert OptionGreeks to Python: {e}"
+                                            "Failed to convert VenueOptionGreeks custom data to Python: {e}"
                                         );
                                     }
                                 });

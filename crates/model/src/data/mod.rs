@@ -55,7 +55,8 @@ pub use close::InstrumentClose;
 #[cfg(feature = "python")]
 pub use custom::PythonCustomDataWrapper;
 pub use custom::{
-    CustomData, CustomDataTrait, ensure_custom_data_json_registered, register_custom_data_json,
+    CustomData, CustomDataTrait, custom_data_to_option_greeks, ensure_custom_data_json_registered,
+    register_custom_data_json, register_option_greeks_bridge,
 };
 #[cfg(feature = "python")]
 pub use custom::{

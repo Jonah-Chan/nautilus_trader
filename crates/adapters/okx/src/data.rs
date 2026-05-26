@@ -74,6 +74,7 @@ use crate::{
         },
     },
     config::OKXDataClientConfig,
+    data_types::VenueOptionGreeks,
     http::client::OKXHttpClient,
     websocket::{
         client::OKXWebSocketClient,
@@ -163,6 +164,8 @@ impl OKXDataClient {
     ///
     /// Returns an error if the client fails to initialize.
     pub fn new(client_id: ClientId, config: OKXDataClientConfig) -> anyhow::Result<Self> {
+        crate::data_types::register_okx_custom_data();
+
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
 
@@ -359,11 +362,14 @@ impl OKXDataClient {
                                         ts_init,
                                     ) {
                                         Ok(greeks) => {
-                                            if let Err(e) =
-                                                data_sender.send(DataEvent::OptionGreeks(greeks))
+                                            let custom =
+                                                VenueOptionGreeks::from_option_greeks(&greeks)
+                                                    .into_custom_data();
+                                            if let Err(e) = data_sender
+                                                .send(DataEvent::Data(Data::Custom(custom)))
                                             {
                                                 log::error!(
-                                                    "Failed to emit option greeks event: {e}"
+                                                    "Failed to emit venue option greeks custom data event: {e}"
                                                 );
                                             }
                                         }

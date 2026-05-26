@@ -3551,9 +3551,14 @@ impl ParquetDataCatalog {
                     continue;
                 };
 
-                if let Some(data_relative_path) =
-                    relative_path.strip_prefix(&format!("{data_name}/"))
+                let data_relative_path = if let Some(type_name) = data_name.strip_prefix("custom/")
                 {
+                    relative_path.strip_prefix(&format!("data/custom/{type_name}/"))
+                } else {
+                    relative_path.strip_prefix(&format!("{data_name}/"))
+                };
+
+                if let Some(data_relative_path) = data_relative_path {
                     if let Some(identifiers) = identifiers {
                         let identifier_path = data_relative_path
                             .split_once('/')
@@ -3748,9 +3753,12 @@ impl ParquetDataCatalog {
             return Ok(());
         }
 
-        // Convert data class name to filename (e.g., "quotes" -> "quotes")
-        // The data_cls should already be in the correct format (snake_case)
-        let data_name = to_snake_case(data_cls);
+        // Convert standard data class names to filename form while preserving custom type names.
+        let data_name = if data_cls.starts_with("custom/") {
+            data_cls.to_string()
+        } else {
+            to_snake_case(data_cls)
+        };
 
         // List all feather files for this data class
         let feather_files =

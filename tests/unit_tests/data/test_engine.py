@@ -70,14 +70,17 @@ from nautilus_trader.data.messages import UnsubscribeOrderBook
 from nautilus_trader.data.messages import UnsubscribeQuoteTicks
 from nautilus_trader.data.messages import UnsubscribeTradeTicks
 from nautilus_trader.model.book import OrderBook
+from nautilus_trader.model.custom import customdataclass
 from nautilus_trader.model.data import NULL_ORDER
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarSpecification
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.data import CustomData
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.data import InstrumentStatus
+from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import OrderBookDepth10
@@ -109,7 +112,9 @@ from nautilus_trader.model.instruments.option_spread import OptionSpread
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.catalog.parquet import _timestamps_to_filename
+from nautilus_trader.persistence.writer import StreamingFeatherWriter
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.mocks.data import MockMarketDataClient
 from nautilus_trader.test_kit.mocks.data import setup_catalog
@@ -128,6 +133,41 @@ AAPL_XNAS = TestInstrumentProvider.equity()
 XBTUSD_BITMEX = TestInstrumentProvider.xbtusd_bitmex()
 BTCUSDT_BINANCE = TestInstrumentProvider.btcusdt_binance()
 BTCUSDT_PERP_BINANCE = TestInstrumentProvider.btcusdt_perp_binance()
+
+
+@customdataclass
+class TestVenueOptionGreeks(Data):
+    instrument_id: InstrumentId
+    delta: float
+    gamma: float
+    vega: float
+    theta: float
+    rho: float
+    mark_iv: float = 0.0
+    bid_iv: float = 0.0
+    ask_iv: float = 0.0
+    underlying_price: float = 0.0
+    open_interest: float = 0.0
+    convention: str = "BLACK_SCHOLES"
+
+    def to_option_greeks(self) -> OptionGreeks:
+        return OptionGreeks(
+            instrument_id=self.instrument_id,
+            delta=self.delta,
+            gamma=self.gamma,
+            vega=self.vega,
+            theta=self.theta,
+            rho=self.rho,
+            mark_iv=self.mark_iv,
+            bid_iv=self.bid_iv,
+            ask_iv=self.ask_iv,
+            underlying_price=self.underlying_price,
+            open_interest=self.open_interest,
+            ts_event=self.ts_event,
+            ts_init=self.ts_init,
+        )
+
+
 ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
 
 
@@ -491,6 +531,100 @@ class TestDataEngine:
         assert self.data_engine.subscribed_custom_data() == [
             DataType(type=Data, metadata={"Type": "news"}),
         ]
+
+    def test_process_venue_option_greeks_custom_data_publishes_standard_option_greeks(self):
+        # Arrange
+        instrument_id = BTCUSDT_BINANCE.id
+        received = []
+        topic = f"data.option_greeks.{instrument_id.venue}.{instrument_id.symbol}"
+        self.msgbus.subscribe(topic=topic, handler=received.append)
+
+        venue_greeks = TestVenueOptionGreeks(
+            instrument_id=instrument_id,
+            delta=0.55,
+            gamma=0.02,
+            vega=0.15,
+            theta=-0.05,
+            rho=0.01,
+            mark_iv=0.25,
+            bid_iv=0.24,
+            ask_iv=0.26,
+            underlying_price=155.0,
+            open_interest=1000.0,
+            ts_event=1,
+            ts_init=2,
+        )
+        data = CustomData(DataType(TestVenueOptionGreeks), venue_greeks)
+
+        # Act
+        self.data_engine.process(data)
+
+        # Assert
+        assert self.msgbus.is_streaming_type(TestVenueOptionGreeks)
+        assert len(received) == 1
+        option_greeks = received[0]
+        assert isinstance(option_greeks, OptionGreeks)
+        assert option_greeks.instrument_id == instrument_id
+        assert option_greeks.delta == 0.55
+        assert option_greeks.mark_iv == 0.25
+        assert option_greeks.ts_event == 1
+        assert option_greeks.ts_init == 2
+
+    def test_process_venue_option_greeks_custom_data_streams_custom_file(self):
+        # Arrange
+        instrument_id = BTCUSDT_BINANCE.id
+        instance_id = "okx-greeks-live"
+        catalog = ParquetDataCatalog(str(self.tmp_path))
+        stream_path = self.tmp_path / "live" / instance_id
+        writer = StreamingFeatherWriter(
+            path=str(stream_path),
+            cache=self.cache,
+            clock=self.clock,
+            include_types=[TestVenueOptionGreeks],
+            replace=True,
+        )
+        self.msgbus.subscribe("*", writer.write)
+
+        venue_greeks = TestVenueOptionGreeks(
+            instrument_id=instrument_id,
+            delta=0.55,
+            gamma=0.02,
+            vega=0.15,
+            theta=-0.05,
+            rho=0.01,
+            mark_iv=0.25,
+            bid_iv=0.24,
+            ask_iv=0.26,
+            underlying_price=155.0,
+            open_interest=1000.0,
+            ts_event=1,
+            ts_init=2,
+        )
+        data = CustomData(DataType(TestVenueOptionGreeks), venue_greeks)
+
+        # Act
+        self.data_engine.process(data)
+        writer.close()
+        catalog.convert_stream_to_data(
+            instance_id,
+            TestVenueOptionGreeks,
+            subdirectory="live",
+            identifiers=[instrument_id.value],
+        )
+        result = catalog.query(TestVenueOptionGreeks, identifiers=[instrument_id.value])
+
+        # Assert
+        assert len(result) == 1
+        assert isinstance(result[0], CustomData)
+        assert result[0].data_type.type == TestVenueOptionGreeks
+        actual = result[0].data
+        assert isinstance(actual, TestVenueOptionGreeks)
+        assert actual.instrument_id == instrument_id
+        assert actual.delta == 0.55
+        assert actual.gamma == 0.02
+        assert actual.convention == "BLACK_SCHOLES"
+        assert actual.ts_event == 1
+        assert actual.ts_init == 2
 
     def test_execute_unsubscribe_custom_data(self):
         # Arrange

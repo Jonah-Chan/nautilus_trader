@@ -23,6 +23,7 @@ import pytest
 from nautilus_trader.adapters.okx.config import OKXDataClientConfig
 from nautilus_trader.adapters.okx.constants import OKX_VENUE
 from nautilus_trader.adapters.okx.data import OKXDataClient
+from nautilus_trader.adapters.okx.data import VenueOptionGreeks
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.core import nautilus_pyo3
@@ -37,6 +38,7 @@ from nautilus_trader.data.messages import UnsubscribeInstrument
 from nautilus_trader.data.messages import UnsubscribeInstruments
 from nautilus_trader.data.messages import UnsubscribeInstrumentStatus
 from nautilus_trader.data.messages import UnsubscribeOptionGreeks
+from nautilus_trader.model.data import CustomData
 from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.identifiers import ClientId
@@ -735,6 +737,60 @@ async def test_handle_msg_option_greeks_dropped_when_not_subscribed(
 
         # Assert
         assert len(handled_data) == 0
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_handle_msg_venue_option_greeks_custom_data(data_client_builder, monkeypatch):
+    # Arrange
+    client, public_ws, business_ws, http_client, instrument_provider = data_client_builder(
+        monkeypatch,
+    )
+
+    await client._connect()
+    try:
+        handled_data = []
+        client._handle_data = handled_data.append
+
+        instrument_id = InstrumentId(Symbol("BTC-USD-260410-70000-C"), OKX_VENUE)
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(instrument_id.value)
+        pyo3_inner = nautilus_pyo3.okx.VenueOptionGreeks(
+            pyo3_instrument_id,
+            0.5,
+            0.01,
+            10.0,
+            -1.0,
+            0.0,
+            0.5,
+            0.49,
+            0.51,
+            70000.0,
+            100.0,
+            "BLACK_SCHOLES",
+            1_000_000_000,
+            1_000_000_000,
+        )
+        pyo3_custom = nautilus_pyo3.CustomData(
+            nautilus_pyo3.DataType(
+                "VenueOptionGreeks",
+                {"venue": "OKX", "instrument_id": instrument_id.value},
+                instrument_id.value,
+            ),
+            pyo3_inner,
+        )
+
+        # Act
+        client._handle_msg(pyo3_custom)
+
+        # Assert
+        assert len(handled_data) == 1
+        assert isinstance(handled_data[0], CustomData)
+        assert handled_data[0].data_type.type is VenueOptionGreeks
+        assert isinstance(handled_data[0].data, VenueOptionGreeks)
+        assert handled_data[0].data.instrument_id == instrument_id
+        assert handled_data[0].data.delta == 0.5
+        assert handled_data[0].data.to_option_greeks().instrument_id == instrument_id
     finally:
         await client._disconnect()
 

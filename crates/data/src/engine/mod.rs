@@ -1106,10 +1106,7 @@ impl DataEngine {
         } else if let Some(status) = data.downcast_ref::<InstrumentStatus>() {
             self.handle_instrument_status(*status);
         } else if let Some(option_greeks) = data.downcast_ref::<OptionGreeks>() {
-            self.cache.borrow_mut().add_option_greeks(*option_greeks);
-            let topic = switchboard::get_option_greeks_topic(option_greeks.instrument_id);
-            msgbus::publish_option_greeks(topic, option_greeks);
-            self.drain_deferred_commands();
+            self.handle_option_greeks(*option_greeks);
         } else if let Some(custom) = data.downcast_ref::<CustomData>() {
             self.handle_custom_data(custom);
         } else {
@@ -1589,10 +1586,25 @@ impl DataEngine {
         msgbus::publish_any(topic, &close);
     }
 
-    fn handle_custom_data(&self, custom: &CustomData) {
+    fn handle_option_greeks(&mut self, option_greeks: OptionGreeks) {
+        self.cache.borrow_mut().add_option_greeks(option_greeks);
+        let topic = switchboard::get_option_greeks_topic(option_greeks.instrument_id);
+        msgbus::publish_option_greeks(topic, &option_greeks);
+        self.drain_deferred_commands();
+    }
+
+    fn handle_custom_data(&mut self, custom: &CustomData) {
         log::debug!("Processing custom data: {}", custom.data.type_name());
         let topic = switchboard::get_custom_topic(&custom.data_type);
         msgbus::publish_any(topic, custom);
+
+        if let Some(option_greeks) = custom
+            .data
+            .to_option_greeks()
+            .or_else(|| nautilus_model::data::custom_data_to_option_greeks(custom.data.as_ref()))
+        {
+            self.handle_option_greeks(option_greeks);
+        }
     }
 
     /// Drains deferred subscribe/unsubscribe commands pushed by option chain
@@ -3086,4 +3098,125 @@ fn log_if_empty_response<T, I: Display>(data: &[T], id: &I, correlation_id: &UUI
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{any::Any, cell::RefCell, rc::Rc, sync::Arc};
+
+    use nautilus_common::{cache::Cache, clock::TestClock, msgbus};
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{
+        data::{
+            CustomData, CustomDataTrait, Data, DataType, HasTsInit, OptionGreekValues,
+            option_chain::OptionGreeks,
+        },
+        enums::GreeksConvention,
+        identifiers::InstrumentId,
+    };
+    use rstest::rstest;
+
+    use super::DataEngine;
+
+    #[derive(Debug, Clone)]
+    struct BridgeableCustomGreeks {
+        greeks: OptionGreeks,
+    }
+
+    impl HasTsInit for BridgeableCustomGreeks {
+        fn ts_init(&self) -> UnixNanos {
+            self.greeks.ts_init
+        }
+    }
+
+    impl CustomDataTrait for BridgeableCustomGreeks {
+        fn type_name(&self) -> &'static str {
+            "BridgeableCustomGreeks"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn ts_event(&self) -> UnixNanos {
+            self.greeks.ts_event
+        }
+
+        fn to_json(&self) -> anyhow::Result<String> {
+            Ok("{}".to_string())
+        }
+
+        fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+            Arc::new(self.clone())
+        }
+
+        fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<Self>()
+                .is_some_and(|other| other.greeks == self.greeks)
+        }
+
+        fn to_option_greeks(&self) -> Option<OptionGreeks> {
+            Some(self.greeks)
+        }
+    }
+
+    fn sample_option_greeks() -> OptionGreeks {
+        OptionGreeks {
+            instrument_id: InstrumentId::from("BTC-USD-240329-70000-C.OKX"),
+            convention: GreeksConvention::BlackScholes,
+            greeks: OptionGreekValues {
+                delta: 0.55,
+                gamma: 0.02,
+                vega: 0.15,
+                theta: -0.05,
+                rho: 0.01,
+            },
+            mark_iv: Some(0.25),
+            bid_iv: Some(0.24),
+            ask_iv: Some(0.26),
+            underlying_price: Some(70_500.0),
+            open_interest: Some(1_000.0),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(2),
+        }
+    }
+
+    #[rstest]
+    fn process_custom_data_bridges_to_option_greeks_cache_and_topic() {
+        msgbus::get_message_bus().borrow_mut().dispose();
+
+        let greeks = sample_option_greeks();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let received_clone = Rc::clone(&received);
+        let topic = msgbus::switchboard::get_option_greeks_topic(greeks.instrument_id);
+        msgbus::subscribe_option_greeks(
+            topic.into(),
+            msgbus::TypedHandler::from(move |greeks: &OptionGreeks| {
+                received_clone.borrow_mut().push(*greeks);
+            }),
+            None,
+        );
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let mut engine = DataEngine::new(clock, Rc::clone(&cache), None);
+        let custom = CustomData::new(
+            Arc::new(BridgeableCustomGreeks { greeks }),
+            DataType::new(
+                "BridgeableCustomGreeks",
+                None,
+                Some(greeks.instrument_id.to_string()),
+            ),
+        );
+
+        engine.process_data(Data::Custom(custom));
+
+        assert_eq!(
+            cache.borrow().option_greeks(&greeks.instrument_id),
+            Some(&greeks)
+        );
+        assert_eq!(received.borrow().as_slice(), &[greeks]);
+    }
 }

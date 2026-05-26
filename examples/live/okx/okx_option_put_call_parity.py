@@ -74,6 +74,7 @@ except ModuleNotFoundError:  # pragma: no cover - supports direct script executi
 from nautilus_trader.adapters.okx import OKX
 from nautilus_trader.adapters.okx import OKXDataClientConfig
 from nautilus_trader.adapters.okx import OKXLiveDataClientFactory
+from nautilus_trader.adapters.okx.data import VenueOptionGreeks
 from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
 from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
 from nautilus_trader.common.enums import LogColor
@@ -1947,7 +1948,7 @@ def _streaming_config_from_args(args: argparse.Namespace) -> StreamingConfig | N
         catalog_path=args.streaming_catalog_path,
         fs_protocol="file",
         flush_interval_ms=args.streaming_flush_interval_ms,
-        include_types=[QuoteTick, CryptoOption, CryptoPerpetual],
+        include_types=[QuoteTick, VenueOptionGreeks, CryptoOption, CryptoPerpetual],
         replace_existing=args.streaming_replace_existing,
     )
 
